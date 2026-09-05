@@ -1,0 +1,21 @@
+# Environment / secrets
+.env
+venv/
+env/
+*.egg-info/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Data & vector store (never commit raw datasets or the DB itself)
+data/raw/
+data/chroma/
+*.sqlite3
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

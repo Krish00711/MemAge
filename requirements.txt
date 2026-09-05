@@ -1,0 +1,23 @@
+# Core
+python-dotenv==1.0.1
+numpy==1.26.4
+pandas==2.2.2
+tqdm==4.66.4
+
+# Vector store
+chromadb==0.5.5
+
+# Embeddings
+sentence-transformers==3.0.1
+
+# LLM clients (free-tier) — keep both, src/llm/client.py picks one via .env
+google-generativeai==0.7.2
+groq==0.9.0
+
+# Evaluation metrics
+scikit-learn==1.5.1
+evaluate==0.4.2
+nltk==3.8.1
+
+# Testing
+pytest==8.2.2
