@@ -287,6 +287,123 @@ def measure_latency_ms(start_monotonic: float, end_monotonic: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# QA Metrics: F1 and BLEU-1
+# ---------------------------------------------------------------------------
+
+import math as _math
+import re as _re
+from collections import Counter as _Counter
+
+
+_QA_TOKEN_RE = _re.compile(r"[a-z0-9]+", _re.IGNORECASE)
+
+
+def _qa_tokenize(text: str) -> List[str]:
+    """Normalize and tokenize QA text: lowercase, alphanumeric tokens.
+
+    Deterministic, dependency-free. Returns list (preserving duplicates) for
+    bag-of-words F1/BLEU-1. Empty/None returns [].
+    """
+    if not text:
+        return []
+    return [m.lower() for m in _QA_TOKEN_RE.findall(text)]
+
+
+def f1_score(prediction: str, reference: str) -> float:
+    """Compute token-level F1 (bag-of-words overlap).
+
+    Convention:
+      - Tokens = lowercased alphanumeric via ``[a-z0-9]+`` (same as BLEU-1).
+      - Overlap = sum(min(count_pred[t], count_ref[t])) (Counter intersection).
+      - precision = overlap / |pred| ; recall = overlap / |ref|
+        * both empty → 1.0 (exact match, no content)
+        * one empty, other non-empty → 0.0
+        * no overlap → 0.0
+      - F1 = 2*P*R/(P+R) if P+R>0 else 0.0
+      - Handles exact match quickly.
+
+    This is a generic lightweight QA F1; not claimed to reproduce official
+    LoCoMo scoring unless that protocol is implemented.
+
+    Args:
+        prediction: System answer string.
+        reference: Ground-truth answer string.
+
+    Returns:
+        F1 in [0, 1].
+    """
+    pred_tokens = _qa_tokenize(prediction or "")
+    ref_tokens = _qa_tokenize(reference or "")
+    if not pred_tokens and not ref_tokens:
+        return 1.0
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+    # exact token-list match shortcut (also covers exact string after normalization)
+    if pred_tokens == ref_tokens:
+        return 1.0
+    pred_counter = _Counter(pred_tokens)
+    ref_counter = _Counter(ref_tokens)
+    overlap = sum((pred_counter & ref_counter).values())
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(pred_tokens)
+    recall = overlap / len(ref_tokens)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def bleu1_score(prediction: str, reference: str) -> float:
+    """Compute BLEU-1 (unigram precision with brevity penalty).
+
+    Convention:
+      - Tokens as in ``f1_score`` (lowercased alphanumeric).
+      - p1 = matched_unigrams / |pred|  (matched via Counter intersection)
+        * empty pred → 0.0 (unless both empty → 1.0)
+      - Brevity penalty BP = 1 if |pred| > |ref| else exp(1 - |ref|/|pred|)
+        * both empty → 1.0 contribution already handled
+      - BLEU-1 = BP * p1  in [0,1]
+      - No smoothing; pure unigram precision.
+
+    Documented as lightweight approximation; not claimed to match
+    sacreBLEU/official LoCoMo without their protocol.
+
+    Args:
+        prediction: System answer.
+        reference: Ground-truth answer.
+
+    Returns:
+        BLEU-1 in [0,1].
+    """
+    pred_tokens = _qa_tokenize(prediction or "")
+    ref_tokens = _qa_tokenize(reference or "")
+    if not pred_tokens and not ref_tokens:
+        return 1.0
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+    if pred_tokens == ref_tokens:
+        return 1.0
+    pred_counter = _Counter(pred_tokens)
+    ref_counter = _Counter(ref_tokens)
+    matched = sum((pred_counter & ref_counter).values())
+    if matched == 0:
+        return 0.0
+    p1 = matched / len(pred_tokens)
+    # Brevity penalty
+    if len(pred_tokens) > len(ref_tokens):
+        bp = 1.0
+    else:
+        # pred_len <= ref_len
+        # avoid division by zero already handled (pred non-empty)
+        bp = _math.exp(1 - len(ref_tokens) / len(pred_tokens))
+    return bp * p1
+
+
+# BLEU-1 alias (consistent naming)
+bleu_1 = bleu1_score
+bleu1 = bleu1_score
+
+# ---------------------------------------------------------------------------
 # Tokens returned
 # ---------------------------------------------------------------------------
 
