@@ -1,5 +1,14 @@
 """src.eval — retrieval evaluation + benchmark framework for MemAge."""
 
+from src.eval.ablation import (
+    AblationConfig,
+    AblationResult,
+    PassthroughReranker,
+    budget_configs,
+    k_configs,
+    run_ablation,
+    stage_configs,
+)
 from src.eval.adapters import (
     DatasetFileNotFoundError,
     DatasetFormatError,
@@ -9,12 +18,31 @@ from src.eval.adapters import (
     resolve_dataset_file,
     to_eval_dataset,
 )
+from src.eval.baselines import (
+    FullHistoryBaseline,
+    HMemBaseline,
+    MemoryOSBaseline,
+    MemoryR1Baseline,
+    format_full_history,
+    full_history_retrieval_fn,
+    history_from_case,
+    hmem_retrieval_fn,
+    memory_r1_retrieval_fn,
+    memoryos_retrieval_fn,
+)
 from src.eval.benchmark import (
     BenchmarkReport,
     BenchmarkResult,
     BenchmarkRunner,
     RetrievalOutcome,
     make_retrieval_fn,
+)
+from src.eval.comparison import (
+    ComparisonResult,
+    StrategyResult,
+    StrategySpec,
+    compare_strategies,
+    format_comparison_table,
 )
 from src.eval.dataset import (
     BenchmarkCase,
@@ -24,6 +52,7 @@ from src.eval.dataset import (
     RetrievalEvalCase,
 )
 from src.eval.evaluator import AggregatedMetrics, QueryMetrics, RetrievalEvaluator
+from src.eval.serialization import to_csv, to_json, write_csv, write_json
 from src.eval.metrics import (
     Timer,
     bleu1_score,
@@ -40,11 +69,27 @@ __all__ = [
     "RetrievalEvalCase",
     "EvaluationCase",
     "EvalDataset",
+    "AblationConfig",
+    "AblationResult",
+    "PassthroughReranker",
+    "stage_configs",
+    "k_configs",
+    "budget_configs",
+    "run_ablation",
     "BenchmarkCase",
     "BenchmarkDataset",
+    "ComparisonResult",
+    "StrategyResult",
+    "StrategySpec",
+    "compare_strategies",
+    "format_comparison_table",
     "RetrievalEvaluator",
     "QueryMetrics",
     "AggregatedMetrics",
+    "to_json",
+    "write_json",
+    "to_csv",
+    "write_csv",
     "BenchmarkRunner",
     "BenchmarkReport",
     "BenchmarkResult",
@@ -57,6 +102,16 @@ __all__ = [
     "to_eval_dataset",
     "DatasetFormatError",
     "DatasetFileNotFoundError",
+    "FullHistoryBaseline",
+    "HMemBaseline",
+    "MemoryOSBaseline",
+    "MemoryR1Baseline",
+    "format_full_history",
+    "full_history_retrieval_fn",
+    "history_from_case",
+    "hmem_retrieval_fn",
+    "memory_r1_retrieval_fn",
+    "memoryos_retrieval_fn",
     "recall_at_k",
     "precision_at_k",
     "reciprocal_rank",

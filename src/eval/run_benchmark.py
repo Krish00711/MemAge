@@ -9,7 +9,10 @@ Dataset resolution: ``<data-dir>/<dataset>/*.json`` (default ``data-dir`` is
 the repository ``data/`` folder — see ``data/README.md`` for the expected
 file names). No network, no downloads, no ChromaDB access.
 
-Baselines MemoryOS / Memory-R1 / H-MEM are Phase 7 and not implemented here.
+Baselines: ``none`` (our system), ``full_history`` (upper bound),
+``memoryos`` (tiered approximation), ``memory_r1`` (budgeted approximation),
+and ``hmem`` (hierarchical approximation — see src/eval/baselines.py) all run
+on synthetic data today. All checklist baselines are now implemented.
 """
 
 from __future__ import annotations
@@ -26,7 +29,24 @@ from src.eval.adapters import (
     load_dataset,
     resolve_dataset_file,
 )
+from src.eval.ablation import (
+    AblationConfig,
+    AblationResult,
+    PassthroughReranker,
+    budget_configs,
+    k_configs,
+    run_ablation,
+    stage_configs,
+)
+from src.eval.baselines import (
+    FullHistoryBaseline,
+    HMemBaseline,
+    MemoryOSBaseline,
+    MemoryR1Baseline,
+)
 from src.eval.benchmark import BenchmarkRunner, make_retrieval_fn
+from src.eval.comparison import StrategySpec, compare_strategies, format_comparison_table
+from src.eval.serialization import write_csv, write_json
 from src.eval.dataset import BenchmarkDataset
 from src.retrieval.context import RetrievalContext
 from src.retrieval.retriever import CoarseRetriever
@@ -41,15 +61,14 @@ SUPPORTED_DATASETS = {
 
 SUPPORTED_BASELINES = {
     "none": "Our System — two-stage retrieval + QA (memory-based)",
-    "full_history": "Full-history upper bound (injectable strategy, no store)",
-    # Future baselines — not yet implemented
-    "memoryos": "MemoryOS baseline (Phase 7)",
-    "memory_r1": "Memory-R1 baseline (Phase 7)",
-    "hmem": "H-MEM baseline (Phase 7)",
+    "full_history": "Full-history upper bound (entire history as context, no retrieval)",
+    "memoryos": "MemoryOS-style tiered baseline (project-level approximation, not a reproduction)",
+    "memory_r1": "Memory-R1-style budgeted baseline (project-level approximation, not a reproduction)",
+    "hmem": "H-MEM-style hierarchical baseline (project-level approximation, not a reproduction)",
 }
 
 # Baselines that are not yet implemented but will be
-NOT_YET_IMPLEMENTED_BASELINES = {"memoryos", "memory_r1", "hmem"}
+NOT_YET_IMPLEMENTED_BASELINES: set = set()
 
 # Default token budget forwarded to the retrieval pipeline (used when the
 # --token-budget flag is omitted).
@@ -151,6 +170,48 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Token budget passed through to the retrieval pipeline "
             f"(default: {DEFAULT_TOKEN_BUDGET})."
+        ),
+    )
+    parser.add_argument(
+        "--compare",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated baselines to compare on the same dataset, e.g. "
+            "'none,full_history,memoryos,memory_r1,hmem' (synthetic only). "
+            "When omitted, the single --baseline behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--ablate",
+        type=str,
+        default=None,
+        help=(
+            "Run one ablation family on the synthetic dataset: 'stage' "
+            "(coarse-only vs two-stage), 'k:<v,v,...>' (Stage-1 candidate "
+            "counts), or 'budget:<v,v,...>' (token budgets), e.g. "
+            "'--ablate k:1,3,5'. Mutually exclusive with --compare."
+        ),
+    )
+    parser.add_argument(
+        "--export-json",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the --compare/--ablate result as JSON to PATH "
+            "(ignored when the export flags are omitted; requires "
+            "--compare or --ablate)."
+        ),
+    )
+    parser.add_argument(
+        "--export-csv",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the --compare/--ablate result as CSV to PATH (one row "
+            "per strategy/configuration; requires --compare or --ablate)."
         ),
     )
     parser.add_argument(
@@ -283,29 +344,235 @@ def _synthetic_pipeline() -> RetrievalContext:
     )
 
 
+def _synthetic_answer(query: str, context: str) -> str:
+    """Deterministic shared answer function for the synthetic demo."""
+    if "preference" in query:
+        return "User prefers dark mode" if "dark mode" in context else "Unknown"
+    if "where" in query.lower() or "live" in query:
+        return "User lives in Berlin" if "Berlin" in context else "Unknown"
+    return "Unknown"
+
+
 def run_synthetic_demo(
-    k: int = 5, token_budget: int = DEFAULT_TOKEN_BUDGET
+    k: int = 5, token_budget: int = DEFAULT_TOKEN_BUDGET, baseline: str = "none"
 ) -> int:
     """Run the synthetic benchmark (no network, no store, no API keys).
 
-    The retrieval step is the real pipeline (``RetrievalContext``) over an
-    in-memory store; ``token_budget`` is passed through to it via
-    ``make_retrieval_fn``. Returns exit code 0.
+    Baselines:
+        * ``none`` - the real two-stage pipeline (``RetrievalContext``) over
+          an in-memory store; ``token_budget`` is passed through to it via
+          ``make_retrieval_fn``.
+        * ``full_history`` - the entire history as context, no retrieval
+          (``FullHistoryBaseline``); ``token_budget`` does not apply.
+        * ``memoryos`` - tiered STM/LTM approximation (``MemoryOSBaseline``);
+          selects top-``k`` entries by lexical overlap; ``token_budget`` does
+          not apply.
+        * ``memory_r1`` - budgeted ranked approximation (``MemoryR1Baseline``);
+          ranks the whole history lexically, then enforces ``token_budget``
+          via the repository's greedy budget selector.
+        * ``hmem`` - hierarchical approximation (``HMemBaseline``); orders
+          candidates tier-first (STM/MTM/LTM coarse-to-fine), then enforces
+          ``token_budget`` via the same greedy budget selector.
+
+    Returns exit code 0.
     """
     dataset = BenchmarkDataset.from_synthetic(_SYNTHETIC_CASES, name="synthetic_demo")
 
-    retrieval_fn = make_retrieval_fn(_synthetic_pipeline(), token_budget)
+    if baseline == "full_history":
+        retrieval_fn = FullHistoryBaseline(_SYNTHETIC_MEMORIES)
+        title = f"Synthetic benchmark ({dataset.name}, baseline={baseline})"
+    elif baseline == "memoryos":
+        # ``--k`` doubles as the baseline's selection size (metric cutoff
+        # stays k as well, matching the BenchmarkRunner contract).
+        retrieval_fn = MemoryOSBaseline(_SYNTHETIC_MEMORIES, k=k)
+        title = f"Synthetic benchmark ({dataset.name}, baseline={baseline})"
+    elif baseline == "memory_r1":
+        retrieval_fn = MemoryR1Baseline(
+            _SYNTHETIC_MEMORIES, token_budget=token_budget
+        )
+        title = f"Synthetic benchmark ({dataset.name}, baseline={baseline})"
+    elif baseline == "hmem":
+        retrieval_fn = HMemBaseline(_SYNTHETIC_MEMORIES, token_budget=token_budget)
+        title = f"Synthetic benchmark ({dataset.name}, baseline={baseline})"
+    else:
+        retrieval_fn = make_retrieval_fn(_synthetic_pipeline(), token_budget)
+        title = f"Synthetic benchmark ({dataset.name})"
 
-    def fake_answer(query: str, context: str) -> str:
-        if "preference" in query:
-            return "User prefers dark mode" if "dark mode" in context else "Unknown"
-        if "where" in query.lower() or "live" in query:
-            return "User lives in Berlin" if "Berlin" in context else "Unknown"
-        return "Unknown"
-
-    runner = BenchmarkRunner(retrieval_fn=retrieval_fn, answer_fn=fake_answer, k=k)
+    runner = BenchmarkRunner(
+        retrieval_fn=retrieval_fn, answer_fn=_synthetic_answer, k=k
+    )
     report = runner.run_dataset(dataset)
-    _print_report(report, k, f"Synthetic benchmark ({dataset.name})")
+    _print_report(report, k, title)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Comparison mode (orchestration lives in src/eval/comparison.py)
+# ---------------------------------------------------------------------------
+
+
+def _export_result(result, export_json: Optional[str], export_csv: Optional[str]) -> Optional[int]:
+    """Write the requested exports for *result* after a run.
+
+    Returns ``None`` on success (or when no export was requested), or an
+    exit code (2) if writing failed — the error is printed to stderr.
+    """
+    if not export_json and not export_csv:
+        return None
+    try:
+        if export_json:
+            write_json(result, export_json)
+            print(f"Exported JSON: {export_json}")
+        if export_csv:
+            write_csv(result, export_csv)
+            print(f"Exported CSV: {export_csv}")
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"Error: could not export result: {exc}", file=sys.stderr)
+        return 2
+    return None
+
+
+def build_synthetic_strategies(
+    names: List[str], token_budget: int = DEFAULT_TOKEN_BUDGET, k: int = 5
+) -> List[StrategySpec]:
+    """Build one isolated ``StrategySpec`` per baseline name for synthetic data.
+
+    Each name gets its OWN strategy instance (no sharing between specs).
+    ``none`` is the real two-stage pipeline via ``make_retrieval_fn`` with
+    the CLI ``token_budget``; the four baselines reuse ``_SYNTHETIC_MEMORIES``.
+
+    Raises:
+        ValueError: If any *name* is not a supported baseline.
+    """
+    unknown = [n for n in names if n not in SUPPORTED_BASELINES]
+    if unknown:
+        raise ValueError(
+            f"unknown baseline(s): {unknown}. Supported: {sorted(SUPPORTED_BASELINES)}"
+        )
+    builders = {
+        "none": lambda: make_retrieval_fn(_synthetic_pipeline(), token_budget),
+        "full_history": lambda: FullHistoryBaseline(_SYNTHETIC_MEMORIES),
+        "memoryos": lambda: MemoryOSBaseline(_SYNTHETIC_MEMORIES, k=k),
+        "memory_r1": lambda: MemoryR1Baseline(
+            _SYNTHETIC_MEMORIES, token_budget=token_budget
+        ),
+        "hmem": lambda: HMemBaseline(_SYNTHETIC_MEMORIES, token_budget=token_budget),
+    }
+    return [StrategySpec(name=n, retrieval_fn=builders[n]()) for n in names]
+
+
+def run_synthetic_comparison(
+    names: List[str],
+    k: int = 5,
+    token_budget: int = DEFAULT_TOKEN_BUDGET,
+    export_json: Optional[str] = None,
+    export_csv: Optional[str] = None,
+) -> int:
+    """Run a comparison of *names* on the synthetic dataset and print a table.
+
+    Optional *export_json*/*export_csv* paths serialize the
+    ``ComparisonResult`` (see ``src/eval/serialization.py``).
+
+    Returns exit code 0 (2 on validation/export failure, before or after the
+    run respectively).
+    """
+    try:
+        specs = build_synthetic_strategies(names, token_budget=token_budget, k=k)
+        result = compare_strategies(
+            BenchmarkDataset.from_synthetic(_SYNTHETIC_CASES, name="synthetic_demo"),
+            specs,
+            _synthetic_answer,
+            k=k,
+        )
+    except (ValueError, TypeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"Comparison ({result.dataset_name}, k={result.k}): "
+        f"{result.num_cases} cases, {len(result.results)} strategies"
+    )
+    print(format_comparison_table(result))
+    export_code = _export_result(result, export_json, export_csv)
+    if export_code is not None:
+        return export_code
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Ablation mode (infrastructure in src/eval/ablation.py)
+# ---------------------------------------------------------------------------
+
+
+def build_synthetic_ablation_spec(
+    cfg: AblationConfig, token_budget: int = DEFAULT_TOKEN_BUDGET
+) -> StrategySpec:
+    """Map one ablation config onto a synthetic two-stage strategy spec.
+
+    Config params honored (defaults = the current synthetic baseline setup):
+        * ``stage``: ``"two_stage"`` (default) uses the demo lexical reranker;
+          ``"coarse_only"`` bypasses Stage-2 via ``PassthroughReranker``.
+        * ``k``: Stage-1 candidate count (default: all synthetic memories).
+        * ``token_budget``: budget forwarded to ``make_retrieval_fn``
+          (default: the CLI/config budget).
+
+    Raises:
+        ValueError: Unknown ``stage`` value.
+    """
+    params = cfg.params
+    stage = params.get("stage", "two_stage")
+    if stage not in ("coarse_only", "two_stage"):
+        raise ValueError(
+            f"unknown stage {stage!r} (expected coarse_only | two_stage)"
+        )
+    pipe_k = params.get("k", len(_SYNTHETIC_MEMORIES))
+    budget = params.get("token_budget", token_budget)
+    reranker = _LexicalReranker() if stage == "two_stage" else PassthroughReranker()
+    ctx = RetrievalContext(
+        CoarseRetriever(_StaticStore(_SYNTHETIC_MEMORIES)),
+        reranker,
+        k=pipe_k,
+        tier="all",
+    )
+    return StrategySpec(name=cfg.label, retrieval_fn=make_retrieval_fn(ctx, budget))
+
+
+def run_synthetic_ablation(
+    configs: List[AblationConfig],
+    ablation: str,
+    k: int = 5,
+    token_budget: int = DEFAULT_TOKEN_BUDGET,
+    export_json: Optional[str] = None,
+    export_csv: Optional[str] = None,
+) -> int:
+    """Run one ablation family on the synthetic dataset and print a table.
+
+    Optional *export_json*/*export_csv* paths serialize the
+    ``AblationResult`` (see ``src/eval/serialization.py``).
+
+    Returns exit code 0 (2 on validation/export failure, before or after the
+    run respectively).
+    """
+    try:
+        result = run_ablation(
+            BenchmarkDataset.from_synthetic(_SYNTHETIC_CASES, name="synthetic_demo"),
+            configs,
+            lambda cfg: build_synthetic_ablation_spec(cfg, token_budget=token_budget),
+            _synthetic_answer,
+            k=k,
+            ablation=ablation,
+        )
+    except (ValueError, TypeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    comp = result.comparison
+    print(
+        f"Ablation {result.ablation} ({comp.dataset_name}, metric_k={comp.k}): "
+        f"{comp.num_cases} cases, {len(result.configs)} configurations"
+    )
+    print(format_comparison_table(comp))
+    export_code = _export_result(result, export_json, export_csv)
+    if export_code is not None:
+        return export_code
     return 0
 
 
@@ -323,6 +590,11 @@ def _build_strategy(baseline: str, token_budget: int, data_dir: Optional[str]):
         ctx = RetrievalContext(CoarseRetriever(store), LLMReranker(call_llm), ...)
         retrieval_fn = make_retrieval_fn(ctx, token_budget)   # budget passes here
         answer_fn = lambda q, context: call_llm(...)
+
+    For ``full_history``, ``memoryos``, ``memory_r1``, and ``hmem`` the
+    retrieval side needs no store — the context can be built per case from
+    adapter metadata via the baselines in ``src/eval/baselines.py`` — but
+    answer generation still requires ``src/llm``.
 
     Neither module exists yet (owned by teammates), so no strategy can be
     constructed without inventing interfaces. The dataset loading path above
@@ -358,10 +630,38 @@ def run_dataset_benchmark(
 
     strategy = _build_strategy(baseline, token_budget, data_dir)
     if strategy is None:
+        if baseline == "full_history":
+            reason = (
+                "the full-history context can be built from dataset metadata "
+                "(src/eval/baselines.py) but answer generation still requires "
+                "src/llm (call_llm), which is not implemented yet"
+            )
+        elif baseline == "memoryos":
+            reason = (
+                "the tiered-memory context can be built from dataset metadata "
+                "(src/eval/baselines.py) but answer generation still requires "
+                "src/llm (call_llm), which is not implemented yet"
+            )
+        elif baseline == "memory_r1":
+            reason = (
+                "the budgeted-ranked context can be built from dataset metadata "
+                "(src/eval/baselines.py) but answer generation still requires "
+                "src/llm (call_llm), which is not implemented yet"
+            )
+        elif baseline == "hmem":
+            reason = (
+                "the hierarchical context can be built from dataset metadata "
+                "(src/eval/baselines.py) but answer generation still requires "
+                "src/llm (call_llm), which is not implemented yet"
+            )
+        else:
+            reason = (
+                "building the retrieval/answer strategy requires src/store "
+                "(tiered memory store) and src/llm (call_llm), which are not "
+                "implemented yet"
+            )
         print(
-            f"Error: cannot execute baseline '{baseline}' yet - building the "
-            "retrieval/answer strategy requires src/store (tiered memory "
-            "store) and src/llm (call_llm), which are not implemented yet. "
+            f"Error: cannot execute baseline '{baseline}' yet - {reason}. "
             f"Dataset parsing succeeded ({len(loaded)} cases, "
             f"token_budget={token_budget}).",
             file=sys.stderr,
@@ -388,6 +688,121 @@ def main(argv: Optional[List[str]] = None) -> int:
     """
     args = parse_args(argv)
 
+    # --compare and --ablate are mutually exclusive modes.
+    if args.compare is not None and args.ablate is not None:
+        print("Error: use only one of --compare / --ablate", file=sys.stderr)
+        return 1
+
+    # Export flags apply only to the structured-result modes.
+    if (args.export_json or args.export_csv) and (
+        args.compare is None and args.ablate is None
+    ):
+        print(
+            "Error: --export-json/--export-csv require --compare or --ablate",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Comparison mode (orthogonal to --baseline; validated here, runs on
+    # synthetic only until real-dataset strategies exist).
+    if args.compare is not None:
+        names = [n.strip() for n in args.compare.split(",") if n.strip()]
+        unknown = [n for n in names if n not in SUPPORTED_BASELINES]
+        if not names:
+            print(
+                "Error: --compare requires at least one baseline name, e.g. "
+                "--compare none,full_history",
+                file=sys.stderr,
+            )
+            return 1
+        if unknown:
+            print(
+                f"Error: unknown baseline(s) in --compare: {unknown}. "
+                f"Supported: {sorted(SUPPORTED_BASELINES)}",
+                file=sys.stderr,
+            )
+            return 1
+        if len(set(names)) != len(names):
+            print("Error: duplicate baseline names in --compare", file=sys.stderr)
+            return 1
+        if args.dataset != "synthetic":
+            print(
+                "Error: --compare currently requires --dataset synthetic "
+                "(strategy construction for real datasets awaits src/llm).",
+                file=sys.stderr,
+            )
+            return 2
+        return run_synthetic_comparison(
+            names,
+            k=args.k,
+            token_budget=args.token_budget,
+            export_json=args.export_json,
+            export_csv=args.export_csv,
+        )
+
+    # Ablation mode (also synthetic-only; mutually exclusive with --compare).
+    if args.ablate is not None:
+        kind, _, raw = args.ablate.partition(":")
+        kind, raw = kind.strip(), raw.strip()
+        if kind == "stage":
+            if raw:
+                print(
+                    "Error: --ablate stage takes no values "
+                    "(stage=coarse_only,stage=two_stage are fixed)",
+                    file=sys.stderr,
+                )
+                return 1
+            configs, ablation = stage_configs(), "retrieval_stage"
+        elif kind in ("k", "budget"):
+            if not raw:
+                print(
+                    f"Error: --ablate {kind} requires values, e.g. "
+                    f"--ablate {kind}:1,3,5",
+                    file=sys.stderr,
+                )
+                return 1
+            values: List[int] = []
+            for part in raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    values.append(_positive_int(part))
+                except argparse.ArgumentTypeError as exc:
+                    print(f"Error: invalid value {part!r}: {exc}", file=sys.stderr)
+                    return 1
+            if not values:
+                print(f"Error: --ablate {kind} requires values", file=sys.stderr)
+                return 1
+            try:
+                configs = k_configs(values) if kind == "k" else budget_configs(values)
+            except (TypeError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            ablation = "k" if kind == "k" else "token_budget"
+        else:
+            print(
+                f"Error: unknown ablation kind {kind!r}. "
+                f"Supported: stage, k, budget",
+                file=sys.stderr,
+            )
+            return 1
+        if args.dataset != "synthetic":
+            print(
+                "Error: --ablate currently requires --dataset synthetic "
+                "(strategy construction for real datasets awaits src/llm).",
+                file=sys.stderr,
+            )
+            return 2
+        return run_synthetic_ablation(
+            configs,
+            ablation=ablation,
+            k=args.k,
+            token_budget=args.token_budget,
+            export_json=args.export_json,
+            export_csv=args.export_csv,
+        )
+
     msg = _get_unavailable_message(args.dataset, args.baseline, args.data_dir)
     if msg is not None:
         print(f"Error: {msg}", file=sys.stderr)
@@ -397,7 +812,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     if args.dataset == "synthetic":
-        return run_synthetic_demo(k=args.k, token_budget=args.token_budget)
+        return run_synthetic_demo(
+            k=args.k, token_budget=args.token_budget, baseline=args.baseline
+        )
 
     return run_dataset_benchmark(
         dataset=args.dataset,

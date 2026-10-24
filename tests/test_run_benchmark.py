@@ -49,14 +49,13 @@ def test_unavailable_dataset_behavior():
     assert "Unknown baseline" in msg3
 
 
-def test_not_yet_implemented_baseline():
-    msg = _get_unavailable_message("synthetic", "memoryos")
-    assert msg is not None
-    assert "not yet implemented" in msg
-    assert "Phase 7" in msg
+def test_no_baselines_are_stubs_anymore():
+    # every checklist baseline is implemented now (all approximations)
+    from src.eval.run_benchmark import NOT_YET_IMPLEMENTED_BASELINES
 
-    msg2 = _get_unavailable_message("synthetic", "hmem")
-    assert "not yet implemented" in msg2
+    for name in SUPPORTED_BASELINES:
+        assert _get_unavailable_message("synthetic", name) is None
+    assert NOT_YET_IMPLEMENTED_BASELINES == set()
 
 
 def test_dataset_available_synthetic():
@@ -80,11 +79,11 @@ def test_main_unavailable_dataset_returns_error(capsys):
     assert "not available locally" in err or "Error" in err
 
 
-def test_main_not_implemented_baseline(capsys):
-    code = main(["--dataset", "synthetic", "--baseline", "memoryos"])
-    assert code == 2
-    err = capsys.readouterr().err
-    assert "not yet implemented" in err
+def test_main_hmem_baseline_runs(capsys):
+    # hmem is implemented now: it must run, not return the stub error
+    code = main(["--dataset", "synthetic", "--baseline", "hmem"])
+    assert code == 0
+    assert "baseline=hmem" in capsys.readouterr().out
 
 
 def test_cli_supported_lists():
@@ -218,3 +217,46 @@ def test_dataset_available_uses_data_dir(tmp_path):
     d.mkdir()
     (d / "longmemeval_s.json").write_text("[]", encoding="utf-8")
     assert _dataset_available("longmemeval", str(tmp_path)) is True
+
+
+# ---------------------------------------------------------------------------
+# --baseline full_history (synthetic)
+# ---------------------------------------------------------------------------
+
+
+def _mean_tokens(out):
+    lines = [l for l in out.splitlines() if "Mean tokens" in l]
+    assert lines, "expected a Mean tokens line"
+    return float(lines[0].split(":")[1])
+
+
+def test_cli_full_history_baseline_synthetic(capsys):
+    code = main(["--dataset", "synthetic", "--baseline", "full_history"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Synthetic benchmark (synthetic_demo, baseline=full_history)" in out
+    assert "Mean F1" in out
+    # no ranking -> retrieval metrics are not reported for this baseline
+    assert "Mean Recall" not in out
+    assert "MRR" not in out
+    # token usage still measured
+    assert _mean_tokens(out) > 0
+
+
+def test_cli_full_history_ignores_token_budget(capsys):
+    # Tight budget that would exclude everything from the retrieval pipeline
+    code = main(
+        ["--dataset", "synthetic", "--baseline", "full_history", "--token-budget", "5"]
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert _mean_tokens(out) > 5  # full history returned regardless of budget
+
+
+def test_cli_default_baseline_unchanged(capsys):
+    # baseline none behavior is preserved (pipeline + budget still applies)
+    code = main(["--dataset", "synthetic", "--token-budget", "12"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Synthetic benchmark (synthetic_demo)" in out
+    assert _mean_tokens(out) <= 12
