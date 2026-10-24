@@ -42,5 +42,20 @@ Decision = {
 
 `retrieve_context(query: str, token_budget: int) -> str`  (already formatted, ready to drop into the final prompt)
 
+`retrieve_ranked(query: str, token_budget: int) -> tuple[str, list[str]]`
+
+- Same pipeline as `retrieve_context` (Stage-1 retrieval → Stage-2 rerank → token-budget selection → format), returning `(formatted_context, selected_ids)`.
+- `selected_ids` are the `id` fields of the memories that **survived token-budget selection**, in final display order — 1:1 and in-order with the `[Memory N]` blocks of `formatted_context`. Selected items lacking a string `id` still appear in the context but are omitted from `selected_ids`.
+- `retrieve_context` is a thin wrapper that returns only the first element, so its behavior is unchanged.
+- Empty result is `("", [])`.
+
+## src/eval/  (benchmark wiring — retrieval IDs)
+
+`make_retrieval_fn(retrieval_context, token_budget) -> Callable[[str], RetrievalOutcome]`
+
+- Wraps any object exposing `retrieve_ranked(...)` into a `BenchmarkRunner.retrieval_fn` that returns `RetrievalOutcome(context=..., retrieved_ids=..., tokens=...)`.
+- `BenchmarkRunner` additionally normalizes a raw `retrieval_fn` result of the form `(context_str, retrieved_ids_list)` — i.e. `retrieval_fn=lambda q: ctx.retrieve_ranked(q, budget)` works directly.
+- With `retrieved_ids` present, `BenchmarkResult` fills `retrieval_recall` / `retrieval_precision` / `retrieval_rr` and the `BenchmarkReport` retrieval aggregates.
+
 ---
 Update the sections above as soon as an interface is decided — do not let this file go stale.

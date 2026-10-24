@@ -13,6 +13,8 @@ __pycache__/
 # Data & vector store (never commit raw datasets or the DB itself)
 data/raw/
 data/chroma/
+data/locomo/
+data/longmemeval/
 *.sqlite3
 
 # OS/editor

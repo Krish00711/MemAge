@@ -89,8 +89,11 @@ class BenchmarkReport:
 
 
 # Type aliases for injected callables
-# retrieval_fn: (query: str) -> str | RetrievalOutcome | dict
-RetrievalFn = Callable[[str], Union[str, RetrievalOutcome, Dict[str, Any]]]
+# retrieval_fn: (query: str) -> str | RetrievalOutcome | dict | (context, ids) tuple
+RetrievalFn = Callable[
+    [str],
+    Union[str, RetrievalOutcome, Dict[str, Any], Tuple[str, Optional[List[str]]]],
+]
 # answer_fn: (query: str, context: str) -> str
 AnswerFn = Callable[[str, str], str]
 # memory_prepare_fn: (case: BenchmarkCase) -> None
@@ -102,12 +105,14 @@ MemoryPrepareFn = Callable[[BenchmarkCase], Any]
 # ---------------------------------------------------------------------------
 
 
-def _normalize_retrieval_output(raw: Union[str, RetrievalOutcome, Dict[str, Any]]) -> RetrievalOutcome:
+def _normalize_retrieval_output(raw: Union[str, RetrievalOutcome, Dict[str, Any], Tuple[str, Optional[List[str]]]]) -> RetrievalOutcome:
     """Normalize retrieval_fn return to RetrievalOutcome.
 
     Supports:
       - str → context only
       - RetrievalOutcome → as-is
+      - (context, retrieved_ids) tuple → context + IDs (as produced by
+        ``RetrievalContext.retrieve_ranked``)
       - dict with keys 'context'/'retrieved_ids'/'tokens'
     """
     if isinstance(raw, RetrievalOutcome):
@@ -117,6 +122,16 @@ def _normalize_retrieval_output(raw: Union[str, RetrievalOutcome, Dict[str, Any]
         return raw
     if isinstance(raw, str):
         return RetrievalOutcome(context=raw, tokens=tokens_returned(raw))
+    # Tuple shape: (context_str, retrieved_ids | None) — from retrieve_ranked
+    if (
+        isinstance(raw, tuple)
+        and len(raw) == 2
+        and isinstance(raw[0], str)
+        and (raw[1] is None or isinstance(raw[1], (list, tuple)))
+    ):
+        ctx = raw[0]
+        rids: Optional[List[str]] = list(raw[1]) if raw[1] is not None else None
+        return RetrievalOutcome(context=ctx, retrieved_ids=rids, tokens=tokens_returned(ctx))
     if isinstance(raw, dict):
         ctx = raw.get("context", raw.get("formatted_context", ""))
         rids = raw.get("retrieved_ids", raw.get("ids"))
@@ -129,6 +144,50 @@ def _normalize_retrieval_output(raw: Union[str, RetrievalOutcome, Dict[str, Any]
     return RetrievalOutcome(context=ctx, tokens=tokens_returned(ctx))
 
 
+def make_retrieval_fn(retrieval_context: Any, token_budget: int) -> RetrievalFn:
+    """Build a ``BenchmarkRunner`` ``retrieval_fn`` from a real pipeline.
+
+    Wires the two-stage retrieval pipeline (``RetrievalContext``) into the
+    benchmark so that each case produces a :class:`RetrievalOutcome`
+    containing **both** the formatted context and the ordered
+    ``retrieved_ids`` — enabling Recall@K / Precision@K / MRR on real output.
+
+    Args:
+        retrieval_context: Any object providing
+            ``retrieve_ranked(query, token_budget) -> (context, ids)``
+            (e.g. ``src.retrieval.context.RetrievalContext``). Duck-typed so
+            this module stays decoupled from concrete retrieval internals.
+        token_budget: Token budget forwarded to ``retrieve_ranked``.
+
+    Returns:
+        Callable ``(query) -> RetrievalOutcome`` suitable for
+        ``BenchmarkRunner(retrieval_fn=...)``.
+
+    Raises:
+        TypeError: If *retrieval_context* lacks ``retrieve_ranked``.
+        ValueError: If *token_budget* is not a positive integer.
+    """
+    if not hasattr(retrieval_context, "retrieve_ranked") or not callable(
+        getattr(retrieval_context, "retrieve_ranked")
+    ):
+        raise TypeError(
+            "retrieval_context must provide a callable "
+            "retrieve_ranked(query, token_budget) -> (context, ids)"
+        )
+    if not isinstance(token_budget, int) or isinstance(token_budget, bool) or token_budget <= 0:
+        raise ValueError(f"token_budget must be a positive integer, got {token_budget!r}")
+
+    def retrieval_fn(query: str) -> RetrievalOutcome:
+        context, retrieved_ids = retrieval_context.retrieve_ranked(query, token_budget)
+        return RetrievalOutcome(
+            context=context,
+            retrieved_ids=list(retrieved_ids),
+            tokens=tokens_returned(context),
+        )
+
+    return retrieval_fn
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -139,6 +198,9 @@ class BenchmarkRunner:
 
     The runner is strategy-agnostic: inject different ``retrieval_fn`` and
     ``answer_fn`` to represent memory-based system vs full-history upper bound.
+    For the real two-stage pipeline, build the ``retrieval_fn`` with
+    :func:`make_retrieval_fn` (or pass ``lambda q: ctx.retrieve_ranked(q, budget)``
+    directly — both yield context + ``retrieved_ids``).
 
     Args:
         retrieval_fn: Callable ``(query) -> context`` or ``RetrievalOutcome``.

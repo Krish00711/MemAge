@@ -208,3 +208,125 @@ def test_token_integration_consistency():
     runner = BenchmarkRunner(retrieval_fn=retrieval_fn, answer_fn=lambda q, ctx: "ref")
     result = runner.run_single(case)
     assert result.tokens == tokens_returned(ctx_text)
+
+
+# ---------------------------------------------------------------------------
+# Real retrieval pipeline (RetrievalContext) wired into BenchmarkRunner
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from src.eval.benchmark import make_retrieval_fn
+from src.retrieval.context import RetrievalContext
+from src.retrieval.reranker import LLMReranker
+from src.retrieval.retriever import CoarseRetriever
+
+
+class _FakeStore:
+    def __init__(self, items):
+        self._items = items
+
+    def query(self, text: str, k: int, tier: str):
+        return self._items[:k]
+
+
+def _pipeline(token_budget: int = 1000, k: int = 3) -> RetrievalContext:
+    items = [
+        {"id": "mem_001", "text": "User prefers dark mode.", "timestamp": "2026-01-15T10:00:00Z", "source": "s1", "embedding": None},
+        {"id": "mem_002", "text": "User lives in Berlin.", "timestamp": "2026-01-16T12:30:00Z", "source": "s2", "embedding": None},
+        {"id": "mem_003", "text": "User has a cat named Momo.", "timestamp": "2026-01-17T09:00:00Z", "source": "s3", "embedding": None},
+    ]
+
+    def fake_llm(prompt, system=None, **kwargs):
+        return _json.dumps({"rankings": [{"id": "mem_002", "score": 0.9}, {"id": "mem_001", "score": 0.8}]})
+
+    return RetrievalContext(
+        CoarseRetriever(_FakeStore(items)),
+        LLMReranker(fake_llm),
+        k=k,
+        tier="all",
+    )
+
+
+def test_make_retrieval_fn_yields_retrieval_outcome_with_real_ids():
+    ctx = _pipeline()
+    retrieval_fn = make_retrieval_fn(ctx, token_budget=1000)
+
+    outcome = retrieval_fn("What is the user's preference?")
+    assert isinstance(outcome, RetrievalOutcome)
+    assert outcome.context == ctx.retrieve_context("What is the user's preference?", token_budget=1000)
+    assert outcome.retrieved_ids == ["mem_002", "mem_001", "mem_003"]
+    assert outcome.tokens == tokens_returned(outcome.context)
+
+    # Validation of the factory itself
+    with pytest.raises(TypeError):
+        make_retrieval_fn(object(), token_budget=100)
+    with pytest.raises(ValueError, match="token_budget"):
+        make_retrieval_fn(ctx, token_budget=0)
+
+
+def test_benchmark_runner_receives_real_retrieved_ids():
+    ctx = _pipeline()
+    case = BenchmarkCase(
+        query="Where does the user live?",
+        reference_answer="User lives in Berlin",
+        relevant_ids=["mem_002"],
+        case_id="c1",
+    )
+
+    runner = BenchmarkRunner(
+        retrieval_fn=make_retrieval_fn(ctx, token_budget=1000),
+        answer_fn=lambda q, c: "User lives in Berlin" if "Berlin" in c else "",
+        k=5,
+    )
+    result = runner.run_single(case)
+
+    # Real pipeline IDs flow into the result...
+    assert result.retrieved_ids == ["mem_002", "mem_001", "mem_003"]
+    # ...and into retrieval metrics (mem_002 at rank 1; 3 unique IDs considered)
+    assert result.retrieval_recall == pytest.approx(1.0)
+    assert result.retrieval_precision == pytest.approx(1.0 / 3.0)
+    assert result.retrieval_rr == pytest.approx(1.0)
+    assert result.tokens == tokens_returned(ctx.retrieve_context(case.query, token_budget=1000))
+
+    # Aggregates are populated (not None) when real IDs are available
+    report = runner.run_dataset([case])
+    assert report.mean_recall_at_k == pytest.approx(1.0)
+    assert report.mean_precision_at_k == pytest.approx(1.0 / 3.0)
+    assert report.mrr == pytest.approx(1.0)
+
+
+def test_benchmark_accepts_retrieve_ranked_tuple_directly():
+    ctx = _pipeline()
+    case = BenchmarkCase(
+        query="q",
+        reference_answer="User prefers dark mode",
+        relevant_ids=["mem_001"],
+        case_id="c1",
+    )
+
+    # retrieve_ranked's (context, ids) tuple works as a retrieval_fn result
+    runner = BenchmarkRunner(
+        retrieval_fn=lambda q: ctx.retrieve_ranked(q, token_budget=1000),
+        answer_fn=lambda q, c: "User prefers dark mode" if "dark mode" in c else "",
+        k=3,
+    )
+    result = runner.run_single(case)
+    assert result.retrieved_ids == ["mem_002", "mem_001", "mem_003"]
+    assert result.retrieval_recall == pytest.approx(1.0)  # mem_001 within top-3
+    assert result.retrieval_precision == pytest.approx(1.0 / 3.0)
+    assert result.retrieval_rr == pytest.approx(0.5)  # first relevant at rank 2
+    assert result.tokens is not None
+
+
+def test_make_retrieval_fn_respects_token_budget_in_outcome():
+    ctx = _pipeline(token_budget=1000)
+    tight_fn = make_retrieval_fn(ctx, token_budget=12)
+    wide_fn = make_retrieval_fn(ctx, token_budget=1000)
+
+    tight = tight_fn("q")
+    wide = wide_fn("q")
+    # Smaller budget selects fewer memories -> fewer IDs and shorter context
+    assert len(tight.retrieved_ids) < len(wide.retrieved_ids)
+    assert tight.tokens <= 12
+    assert wide.tokens >= tight.tokens

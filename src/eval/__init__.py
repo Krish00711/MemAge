@@ -1,6 +1,21 @@
 """src.eval — retrieval evaluation + benchmark framework for MemAge."""
 
-from src.eval.benchmark import BenchmarkReport, BenchmarkResult, BenchmarkRunner, RetrievalOutcome
+from src.eval.adapters import (
+    DatasetFileNotFoundError,
+    DatasetFormatError,
+    load_dataset,
+    load_locomo,
+    load_longmemeval,
+    resolve_dataset_file,
+    to_eval_dataset,
+)
+from src.eval.benchmark import (
+    BenchmarkReport,
+    BenchmarkResult,
+    BenchmarkRunner,
+    RetrievalOutcome,
+    make_retrieval_fn,
+)
 from src.eval.dataset import (
     BenchmarkCase,
     BenchmarkDataset,
@@ -34,6 +49,14 @@ __all__ = [
     "BenchmarkReport",
     "BenchmarkResult",
     "RetrievalOutcome",
+    "make_retrieval_fn",
+    "load_locomo",
+    "load_longmemeval",
+    "load_dataset",
+    "resolve_dataset_file",
+    "to_eval_dataset",
+    "DatasetFormatError",
+    "DatasetFileNotFoundError",
     "recall_at_k",
     "precision_at_k",
     "reciprocal_rank",

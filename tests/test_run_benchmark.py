@@ -93,3 +93,128 @@ def test_cli_supported_lists():
     assert "none" in SUPPORTED_BASELINES
     assert "full_history" in SUPPORTED_BASELINES
     assert "memoryos" in SUPPORTED_BASELINES
+
+
+# ---------------------------------------------------------------------------
+# --token-budget propagation
+# ---------------------------------------------------------------------------
+
+
+def test_token_budget_argument_parsed():
+    from src.eval.run_benchmark import DEFAULT_TOKEN_BUDGET
+
+    args = parse_args([])
+    assert args.token_budget == DEFAULT_TOKEN_BUDGET
+
+    args2 = parse_args(["--token-budget", "123"])
+    assert args2.token_budget == 123
+
+    # non-positive budget is a usage error (argparse exits with code 2)
+    with pytest.raises(SystemExit):
+        parse_args(["--token-budget", "0"])
+    with pytest.raises(SystemExit):
+        parse_args(["--token-budget", "not-a-number"])
+
+
+def test_token_budget_propagated_to_retrieval_pipeline(monkeypatch):
+    import src.eval.run_benchmark as rb
+
+    original = rb.make_retrieval_fn
+    seen = []
+
+    def spy(retrieval_context, token_budget):
+        seen.append(token_budget)
+        return original(retrieval_context, token_budget)
+
+    monkeypatch.setattr(rb, "make_retrieval_fn", spy)
+
+    code = rb.main(["--dataset", "synthetic", "--token-budget", "77"])
+    assert code == 0
+    assert seen == [77]  # exactly one pipeline build, with the CLI value
+
+
+def test_token_budget_affects_synthetic_output(capsys):
+    import src.eval.run_benchmark as rb
+
+    # Default budget: both synthetic memories selected
+    assert rb.main(["--dataset", "synthetic"]) == 0
+    default_out = capsys.readouterr().out
+    default_tokens = float(
+        [l for l in default_out.splitlines() if "Mean tokens" in l][0].split(":")[1]
+    )
+
+    # Tight budget: fewer memories survive the pipeline's budget selection
+    assert rb.main(["--dataset", "synthetic", "--token-budget", "12"]) == 0
+    tight_out = capsys.readouterr().out
+    tight_tokens = float(
+        [l for l in tight_out.splitlines() if "Mean tokens" in l][0].split(":")[1]
+    )
+
+    assert tight_tokens <= 12
+    assert tight_tokens < default_tokens
+
+
+# ---------------------------------------------------------------------------
+# --data-dir / real dataset handling
+# ---------------------------------------------------------------------------
+
+
+def _write_locomo(tmp_path, n_cases=1):
+    import json
+
+    fixture = [
+        {
+            "sample_id": "sample_1",
+            "conversation": {
+                "speaker_a": "A",
+                "speaker_b": "B",
+                "session_1": [{"speaker": "A", "dia_id": "D1:1", "text": "hello"}],
+                "session_1_date_time": "t",
+            },
+            "qa": [
+                {
+                    "question": f"Question {i}?",
+                    "answer": f"Answer {i}",
+                    "evidence": ["D1:1"],
+                }
+                for i in range(n_cases)
+            ],
+        }
+    ]
+    d = tmp_path / "locomo"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "locomo10.json").write_text(json.dumps(fixture), encoding="utf-8")
+
+
+def test_data_dir_option_respected(tmp_path, capsys):
+    # without files: unavailable at the default location
+    assert _dataset_available("locomo") is False
+    assert _dataset_available("locomo", str(tmp_path)) is False
+
+    _write_locomo(tmp_path, n_cases=3)
+    assert _dataset_available("locomo", str(tmp_path)) is True
+
+    code = main(
+        ["--dataset", "locomo", "--baseline", "none", "--data-dir", str(tmp_path)]
+    )
+    captured = capsys.readouterr()
+    # dataset loaded and parsed through the CLI...
+    assert "Loaded locomo: 3 cases" in captured.out
+    # ...then blocked by the not-yet-available store/LLM strategy
+    assert code == 2
+    assert "src/store" in captured.err and "src/llm" in captured.err
+
+
+def test_real_dataset_without_files_still_reports_missing(capsys):
+    code = main(["--dataset", "longmemeval", "--baseline", "none"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "not available locally" in captured.err
+
+
+def test_dataset_available_uses_data_dir(tmp_path):
+    assert _dataset_available("longmemeval", str(tmp_path)) is False
+    d = tmp_path / "longmemeval"
+    d.mkdir()
+    (d / "longmemeval_s.json").write_text("[]", encoding="utf-8")
+    assert _dataset_available("longmemeval", str(tmp_path)) is True

@@ -78,17 +78,30 @@ class RetrievalContext:
                 raise TypeError("formatter_fn must be callable")
             self.formatter_fn = formatter_fn
 
-    def retrieve_context(self, query: str, token_budget: int) -> str:
-        """Produce final formatted context for *query* within *token_budget*.
+    def retrieve_ranked(
+        self, query: str, token_budget: int
+    ) -> tuple[str, list[str]]:
+        """Produce final context *and* the IDs of the selected memories.
+
+        Runs the full pipeline — Stage-1 coarse retrieval → Stage-2 reranking
+        → token-budget selection → formatting — and returns both artifacts.
 
         Args:
             query: Natural-language query string.
             token_budget: Maximum estimated tokens for the final context.
-                Must be a positive integer (validated by selector).
+                Must be a positive integer.
 
         Returns:
-            Formatted context string ready to drop into an LLM prompt.
-            Empty string if no memories were retrieved or none fit the budget.
+            ``(context, selected_ids)`` where:
+
+            * ``context`` — formatted context string ("" when nothing is
+              retrieved or nothing fits the budget), identical to what
+              :meth:`retrieve_context` returns.
+            * ``selected_ids`` — the ``id`` field of every memory that
+              survived token-budget selection, in final display order.
+              The list is 1:1 and in-order with the ``[Memory N]`` blocks
+              of ``context``.  Selected items lacking a string ``id`` are
+              omitted from this list (they still appear in ``context``).
 
         Raises:
             ValueError: If ``token_budget`` is not a positive integer.
@@ -111,6 +124,34 @@ class RetrievalContext:
         # Formatting
         context = self.formatter_fn(selected)
 
+        # IDs of the final selection, in final (display) order
+        selected_ids: list[str] = []
+        for item in selected:
+            candidate = getattr(item, "candidate", item)
+            cid = candidate.get("id") if isinstance(candidate, dict) else None
+            if isinstance(cid, str):
+                selected_ids.append(cid)
+
+        return context, selected_ids
+
+    def retrieve_context(self, query: str, token_budget: int) -> str:
+        """Produce final formatted context for *query* within *token_budget*.
+
+        Thin wrapper over :meth:`retrieve_ranked` (returns only the context).
+
+        Args:
+            query: Natural-language query string.
+            token_budget: Maximum estimated tokens for the final context.
+                Must be a positive integer (validated by selector).
+
+        Returns:
+            Formatted context string ready to drop into an LLM prompt.
+            Empty string if no memories were retrieved or none fit the budget.
+
+        Raises:
+            ValueError: If ``token_budget`` is not a positive integer.
+        """
+        context, _selected_ids = self.retrieve_ranked(query, token_budget)
         return context
 
     # Make instance callable as alternative API: instance(query, token_budget)

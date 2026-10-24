@@ -5,6 +5,7 @@ Covers 9 required assertions.
 """
 
 import json
+import re
 
 import pytest
 
@@ -264,3 +265,107 @@ def test_deterministic_repeated_calls():
     first = ctx.retrieve_context("query", token_budget=100)
     second = ctx.retrieve_context("query", token_budget=100)
     assert first == second
+
+
+# ---------------------------------------------------------------------------
+# retrieve_ranked: context + ordered selected IDs
+# ---------------------------------------------------------------------------
+
+
+def test_retrieve_ranked_returns_context_and_ids_in_final_order():
+    items = _sample_items()
+    store = FakeStore(items)
+    retriever = CoarseRetriever(store)
+    # LLM puts mem_002 first; mem_001 second; mem_003 unranked -> fallback order
+    llm_response = json.dumps(
+        {"rankings": [{"id": "mem_002", "score": 0.9}, {"id": "mem_001", "score": 0.8}]}
+    )
+    reranker = LLMReranker(_fake_llm(llm_response))
+    ctx = RetrievalContext(retriever, reranker, k=3, tier="all")
+
+    context, ids = ctx.retrieve_ranked("dark mode preference", token_budget=1000)
+
+    # IDs follow the final Stage-2 order, then lexical-fallback remainder
+    assert ids == ["mem_002", "mem_001", "mem_003"]
+    # Every ID maps to its memory content, in order, in the context
+    assert "Berlin" in context and "dark mode" in context and "Momo" in context
+    assert context.index("Berlin") < context.index("dark mode") < context.index("Momo")
+
+
+def test_retrieve_ranked_ids_match_memory_blocks_one_to_one():
+    store = FakeStore(_sample_items())
+    retriever = CoarseRetriever(store)
+    reranker = LLMReranker(
+        _fake_llm(json.dumps({"rankings": [{"id": "mem_003", "score": 0.9}]}))
+    )
+    ctx = RetrievalContext(retriever, reranker, k=3)
+    context, ids = ctx.retrieve_ranked("cat", token_budget=1000)
+
+    block_indices = [int(m) for m in re.findall(r"\[Memory (\d+)\]", context)]
+    # 1:1 and same order as the [Memory N] blocks
+    assert block_indices == list(range(1, len(ids) + 1))
+    assert ids[0] == "mem_003"  # top-ranked memory is block 1 / first id
+
+
+def test_retrieve_ranked_token_budget_controls_returned_ids():
+    huge = {"id": "huge", "text": "word " * 200, "timestamp": "2026-01-01T00:00:00Z", "source": "s1", "embedding": None}
+    small = {"id": "small", "text": "hi", "timestamp": "2026-01-02T00:00:00Z", "source": "s2", "embedding": None}
+    store = FakeStore([huge, small])
+    retriever = CoarseRetriever(store)
+    reranker = LLMReranker(
+        _fake_llm(json.dumps({"rankings": [{"id": "huge", "score": 0.9}, {"id": "small", "score": 0.5}]}))
+    )
+    ctx = RetrievalContext(retriever, reranker, k=2)
+
+    # Tight budget: oversized top memory is skipped -> only "small" returned
+    tight_context, tight_ids = ctx.retrieve_ranked("query", token_budget=30)
+    assert tight_ids == ["small"]
+    assert "huge" not in tight_context
+    assert estimate_tokens(tight_context) <= 30
+
+    # Generous budget: both fit, in reranked order
+    wide_context, wide_ids = ctx.retrieve_ranked("query", token_budget=1000)
+    assert wide_ids == ["huge", "small"]
+    assert "Berlin" not in wide_context  # only the two sample items exist
+    assert estimate_tokens(wide_context) <= 1000
+
+
+def test_retrieve_context_remains_thin_wrapper_over_retrieve_ranked():
+    store = FakeStore(_sample_items())
+    retriever = CoarseRetriever(store)
+    reranker = LLMReranker(_fake_llm(json.dumps({"rankings": [{"id": "mem_001", "score": 0.9}]})))
+    ctx = RetrievalContext(retriever, reranker, k=3)
+
+    # Same string returned through both APIs
+    via_wrapper = ctx.retrieve_context("q", token_budget=1000)
+    via_ranked, ids = ctx.retrieve_ranked("q", token_budget=1000)
+    assert isinstance(via_wrapper, str)
+    assert via_wrapper == via_ranked
+    assert ids  # non-empty selection alongside the wrapper's context
+
+    # Validation behavior unchanged (same error type + message)
+    with pytest.raises(ValueError, match="token_budget"):
+        ctx.retrieve_ranked("q", token_budget=0)
+    with pytest.raises(ValueError, match="token_budget"):
+        ctx.retrieve_ranked("q", token_budget=-5)
+    with pytest.raises(ValueError, match="token_budget"):
+        ctx.retrieve_context("q", token_budget=0)
+
+    # Empty retrieval -> stable empty tuple representation
+    empty_ctx = RetrievalContext(CoarseRetriever(FakeStore([])), reranker, k=5)
+    assert empty_ctx.retrieve_ranked("anything", token_budget=100) == ("", [])
+    assert empty_ctx.retrieve_context("anything", token_budget=100) == ""
+
+
+def test_retrieve_ranked_ids_omit_items_without_string_id():
+    no_id = {"text": "memory without id", "timestamp": "t", "source": "s", "embedding": None}
+    with_id = dict(_sample_items()[0])
+    store = FakeStore([no_id, with_id])
+    retriever = CoarseRetriever(store)
+    reranker = LLMReranker(_fake_llm(json.dumps({"rankings": []})))
+    ctx = RetrievalContext(retriever, reranker, k=2)
+
+    context, ids = ctx.retrieve_ranked("q", token_budget=1000)
+    # Both memories are formatted, but only the one with an id is reported
+    assert context.count("[Memory ") == 2
+    assert ids == ["mem_001"]
