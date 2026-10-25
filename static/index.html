@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MemAge — Selective Memory Agent</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #22263a;
+  --border: #2e3347;
+  --accent: #5b8df6;
+  --accent2: #7c6af7;
+  --green: #34d399;
+  --yellow: #fbbf24;
+  --red: #f87171;
+  --text: #e2e8f0;
+  --muted: #8892a4;
+  --radius: 10px;
+  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif;
+       font-size: 14px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+/* ── Top bar ── */
+#topbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+          background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+#topbar h1 { font-size: 16px; font-weight: 700; background: linear-gradient(90deg, var(--accent), var(--accent2));
+             -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+#health-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+#health-dot.ok { background: var(--green); }
+#health-dot.err { background: var(--red); }
+#health-info { font-size: 12px; color: var(--muted); }
+#topbar-right { margin-left: auto; display: flex; gap: 8px; }
+button.btn { padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border);
+             background: var(--surface2); color: var(--text); cursor: pointer; font-size: 13px; }
+button.btn:hover { border-color: var(--accent); color: var(--accent); }
+button.btn.danger { color: var(--red); }
+button.btn.danger:hover { border-color: var(--red); }
+
+/* ── Main layout ── */
+#main { display: flex; flex: 1; overflow: hidden; }
+
+/* ── Left: chat ── */
+#chat-panel { width: 42%; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+#messages { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.msg { max-width: 85%; border-radius: var(--radius); padding: 10px 13px; line-height: 1.5; }
+.msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
+.msg.agent { align-self: flex-start; background: var(--surface2); border-bottom-left-radius: 3px; }
+.msg.system { align-self: center; font-size: 12px; color: var(--muted); background: none; padding: 4px 0; }
+.msg .refs { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.msg .refs span { background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+                  padding: 1px 5px; margin-right: 4px; cursor: pointer; }
+.msg .refs span:hover { border-color: var(--accent); color: var(--accent); }
+.typing { opacity: .5; font-style: italic; font-size: 13px; }
+#chat-input-row { display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--border); }
+#chat-input { flex: 1; background: var(--surface2); border: 1px solid var(--border);
+              border-radius: 8px; color: var(--text); padding: 8px 12px; font-size: 14px;
+              resize: none; min-height: 40px; max-height: 120px; outline: none; font-family: inherit; }
+#chat-input:focus { border-color: var(--accent); }
+#send-btn { background: var(--accent); border: none; border-radius: 8px; color: #fff;
+            padding: 0 16px; cursor: pointer; font-size: 18px; }
+#send-btn:hover { filter: brightness(1.1); }
+#send-btn:disabled { opacity: .4; cursor: default; }
+#session-row { display: flex; gap: 6px; align-items: center; padding: 6px 10px 0;
+               font-size: 12px; color: var(--muted); }
+#session-input { background: var(--surface2); border: 1px solid var(--border);
+                 border-radius: 5px; color: var(--text); padding: 3px 8px; font-size: 12px; width: 120px; }
+
+/* ── Right: tabs ── */
+#right-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+#tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+.tab { padding: 9px 16px; cursor: pointer; font-size: 13px; color: var(--muted); border-bottom: 2px solid transparent; }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-content { display: none; flex: 1; overflow-y: auto; padding: 12px; }
+.tab-content.active { display: flex; flex-direction: column; gap: 8px; }
+
+/* ── Memory explorer ── */
+#mem-toolbar { display: flex; gap: 8px; flex-shrink: 0; }
+#mem-search { flex: 1; background: var(--surface2); border: 1px solid var(--border);
+              border-radius: 6px; color: var(--text); padding: 6px 10px; font-size: 13px; outline: none; }
+#mem-search:focus { border-color: var(--accent); }
+.tier-tabs { display: flex; gap: 4px; }
+.tier-btn { padding: 4px 10px; border-radius: 5px; border: 1px solid var(--border);
+            background: var(--surface2); color: var(--muted); cursor: pointer; font-size: 12px; }
+.tier-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.mem-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px;
+            padding: 10px 12px; cursor: pointer; }
+.mem-card:hover { border-color: var(--accent); }
+.mem-card .mem-text { font-size: 13px; margin-bottom: 5px; }
+.mem-card .mem-meta { font-size: 11px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+.tier-badge { padding: 1px 7px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+.tier-STM { background: #1e3a5f; color: #60a5fa; }
+.tier-MTM { background: #2d2a1a; color: #fbbf24; }
+.tier-LTM { background: #1e2d1e; color: #34d399; }
+.empty-state { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
+
+/* ── Capacity bar ── */
+.cap-row { display: flex; flex-direction: column; gap: 4px; }
+.cap-label { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+.cap-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.cap-fill { height: 100%; border-radius: 3px; background: var(--accent); transition: width .3s; }
+.cap-fill.warn { background: var(--yellow); }
+.cap-fill.full { background: var(--red); }
+
+/* ── Decision inspector ── */
+.decision-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.decision-card .action { font-weight: 700; font-size: 14px; margin-bottom: 8px; }
+.action-ADD { color: var(--green); }
+.action-UPDATE { color: var(--yellow); }
+.action-DELETE { color: var(--red); }
+.action-NOOP { color: var(--muted); }
+.score-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.score-label { font-size: 12px; color: var(--muted); width: 140px; flex-shrink: 0; }
+.score-bar { flex: 1; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.score-fill { height: 100%; border-radius: 3px; background: var(--accent2); }
+.score-val { font-size: 12px; color: var(--text); width: 36px; text-align: right; flex-shrink: 0; font-family: var(--mono); }
+
+/* ── Timeline ── */
+.timeline-event { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0;
+                  border-bottom: 1px solid var(--border); }
+.tl-action { font-size: 11px; font-weight: 700; width: 60px; flex-shrink: 0; padding-top: 1px; }
+.tl-text { font-size: 13px; flex: 1; }
+.tl-ts { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── Modal ── */
+#modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100; align-items: center; justify-content: center; }
+#modal-overlay.visible { display: flex; }
+#modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+         padding: 24px; max-width: 420px; width: 90%; }
+#modal h2 { font-size: 15px; margin-bottom: 10px; }
+#modal p { font-size: 13px; color: var(--muted); margin-bottom: 18px; line-height: 1.6; }
+#modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* ── Error banner ── */
+#error-banner { display: none; position: fixed; top: 52px; left: 0; right: 0; padding: 8px 16px;
+                background: #7f1d1d; color: #fca5a5; font-size: 13px; z-index: 50; text-align: center; }
+</style>
+</head>
+<body>
+
+<div id="error-banner"></div>
+
+<div id="topbar">
+  <div id="health-dot"></div>
+  <h1>MemAge</h1>
+  <span id="health-info">connecting…</span>
+  <div id="topbar-right">
+    <button class="btn" onclick="refreshMemories()">↻ Refresh</button>
+    <button class="btn danger" onclick="showResetModal()">⚠ Reset</button>
+  </div>
+</div>
+
+<div id="main">
+  <!-- Chat panel -->
+  <div id="chat-panel">
+    <div id="session-row">
+      Session: <input id="session-input" value="web" />
+    </div>
+    <div id="messages"></div>
+    <div id="chat-input-row">
+      <textarea id="chat-input" rows="1" placeholder="Ask anything about what you've told me…"
+                onkeydown="onKey(event)"></textarea>
+      <button id="send-btn" onclick="sendMessage()">➤</button>
+    </div>
+  </div>
+
+  <!-- Right panel -->
+  <div id="right-panel">
+    <div id="tabs">
+      <div class="tab active" onclick="switchTab('memories', this)">Memories</div>
+      <div class="tab" onclick="switchTab('decisions', this)">Decisions</div>
+      <div class="tab" onclick="switchTab('timeline', this)">Timeline</div>
+      <div class="tab" onclick="switchTab('capacity', this)">Capacity</div>
+    </div>
+
+    <!-- Memories tab -->
+    <div id="tab-memories" class="tab-content active">
+      <div id="mem-toolbar">
+        <input id="mem-search" placeholder="Search memories…" oninput="refreshMemories()" />
+        <div class="tier-tabs">
+          <button class="tier-btn active" onclick="setTier('all', this)">All</button>
+          <button class="tier-btn" onclick="setTier('STM', this)">STM</button>
+          <button class="tier-btn" onclick="setTier('MTM', this)">MTM</button>
+          <button class="tier-btn" onclick="setTier('LTM', this)">LTM</button>
+        </div>
+      </div>
+      <div id="mem-list"></div>
+    </div>
+
+    <!-- Decisions tab -->
+    <div id="tab-decisions" class="tab-content">
+      <div id="decisions-list"><div class="empty-state">Send a message to see controller decisions.</div></div>
+    </div>
+
+    <!-- Timeline tab -->
+    <div id="tab-timeline" class="tab-content">
+      <div id="timeline-list"><div class="empty-state">No memory events yet.</div></div>
+    </div>
+
+    <!-- Capacity tab -->
+    <div id="tab-capacity" class="tab-content">
+      <div style="font-size:13px;color:var(--muted);margin-bottom:12px">
+        Tier capacities. STM overflows to MTM; MTM overflows to LTM.
+      </div>
+      <div id="capacity-content"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Reset modal -->
+<div id="modal-overlay">
+  <div id="modal">
+    <h2>⚠ Reset all memories?</h2>
+    <p>This permanently deletes every stored memory across all tiers and clears the event timeline. This cannot be undone.</p>
+    <div id="modal-actions">
+      <button class="btn" onclick="hideModal()">Cancel</button>
+      <button class="btn danger" onclick="doReset()">Delete all</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';  // same origin
+let currentTier = 'all';
+let lastDecisions = [];
+
+// ── Health ──────────────────────────────────────────────────────────────────
+async function checkHealth() {
+  try {
+    const r = await fetch(`${API}/api/health`);
+    if (!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    const dot = document.getElementById('health-dot');
+    dot.className = 'ok';
+    const total = Object.values(d.counts).reduce((a,b) => a+b, 0);
+    const modeTag = d.is_demo ? ' · <span style="color:var(--yellow);font-weight:600">DEMO</span>' : '';
+    document.getElementById('health-info').innerHTML =
+      `${esc(d.provider || 'unknown')}${modeTag} · ${total} memories`;
+    updateCapacity(d.counts, d.stm_capacity, d.mtm_capacity);
+  } catch(e) {
+    document.getElementById('health-dot').className = 'err';
+    document.getElementById('health-info').textContent = 'server unreachable';
+  }
+}
+
+// ── Memories ────────────────────────────────────────────────────────────────
+async function refreshMemories() {
+  const q = document.getElementById('mem-search').value.trim();
+  const params = new URLSearchParams();
+  if (currentTier !== 'all') params.set('tier', currentTier);
+  if (q) params.set('q', q);
+  try {
+    const r = await fetch(`${API}/api/memories?${params}`);
+    const d = await r.json();
+    renderMemories(d.items || []);
+  } catch(e) { showError('Could not load memories: ' + e.message); }
+}
+
+function setTier(tier, btn) {
+  currentTier = tier;
+  document.querySelectorAll('.tier-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  refreshMemories();
+}
+
+function renderMemories(items) {
+  const el = document.getElementById('mem-list');
+  if (!items.length) {
+    el.innerHTML = '<div class="empty-state">No memories found.</div>'; return;
+  }
+  el.innerHTML = items.map(m => `
+    <div class="mem-card" onclick="showMemory('${esc(m.id)}')">
+      <div class="mem-text">${esc(m.text)}</div>
+      <div class="mem-meta">
+        <span class="tier-badge tier-${m.tier || 'STM'}">${m.tier || 'STM'}</span>
+        <span>${esc(m.source || '')}</span>
+        <span>${esc((m.timestamp||'').substring(0,16).replace('T',' '))}</span>
+        <span>accessed ${m.access_count||0}×</span>
+        <span class="mem-delete" style="margin-left:auto;color:var(--red);cursor:pointer"
+              onclick="event.stopPropagation();deleteMemory('${esc(m.id)}')">✕</span>
+      </div>
+    </div>`).join('');
+}
+
+async function deleteMemory(id) {
+  if (!confirm(`Delete memory "${id}"?`)) return;
+  await fetch(`${API}/api/memories/${encodeURIComponent(id)}`, {method:'DELETE'});
+  refreshMemories();
+  checkHealth();
+}
+
+async function showMemory(id) {
+  const r = await fetch(`${API}/api/memories/${encodeURIComponent(id)}`);
+  if (!r.ok) return;
+  const m = await r.json();
+  alert(`ID: ${m.id}\nTier: ${m.tier}\nSource: ${m.source}\nTimestamp: ${m.timestamp}\nAccess count: ${m.access_count}\n\n${m.text}`);
+}
+
+// ── Chat ────────────────────────────────────────────────────────────────────
+function onKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+async function sendMessage() {
+  const input = document.getElementById('chat-input');
+  const msg = input.value.trim();
+  if (!msg) return;
+  const session = document.getElementById('session-input').value.trim() || 'web';
+  input.value = '';
+  input.style.height = '';
+
+  addMessage(msg, 'user');
+  const typing = addMessage('…', 'agent typing');
+  document.getElementById('send-btn').disabled = true;
+
+  try {
+    const r = await fetch(`${API}/api/chat`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({message: msg, session_id: session}),
+    });
+    const d = await r.json();
+    typing.remove();
+    if (!r.ok) { addMessage('Error: ' + (d.error || r.status), 'agent'); return; }
+
+    const answerEl = addMessage(d.answer || '(no answer)', 'agent');
+    if (d.retrieved_ids && d.retrieved_ids.length) {
+      const refs = document.createElement('div');
+      refs.className = 'refs';
+      refs.innerHTML = 'Retrieved: ' + d.retrieved_ids.map(id =>
+        `<span onclick="showMemory('${esc(id)}')">${esc(id)}</span>`).join('');
+      answerEl.appendChild(refs);
+    }
+    if (d.turn_result) renderDecisions(d.turn_result);
+    refreshMemories();
+    checkHealth();
+    refreshTimeline();
+  } catch(e) {
+    typing.remove();
+    addMessage('Network error: ' + e.message, 'agent');
+  } finally {
+    document.getElementById('send-btn').disabled = false;
+  }
+}
+
+function addMessage(text, cls) {
+  const msgs = document.getElementById('messages');
+  const el = document.createElement('div');
+  el.className = `msg ${cls}`;
+  el.textContent = text;
+  msgs.appendChild(el);
+  msgs.scrollTop = msgs.scrollHeight;
+  return el;
+}
+
+// ── Decisions ───────────────────────────────────────────────────────────────
+function renderDecisions(turnResult) {
+  const el = document.getElementById('decisions-list');
+  if (!turnResult.candidates || !turnResult.candidates.length) {
+    el.innerHTML = '<div class="empty-state">No candidates extracted.</div>'; return;
+  }
+  el.innerHTML = turnResult.candidates.map(c => {
+    const d = c.decision;
+    const scores = d.scores || {};
+    const scoreNames = ['importance','temporal_validity','contradiction','storage_pressure'];
+    return `<div class="decision-card">
+      <div class="action action-${d.action}">${d.action}${d.target_id ? ` → ${esc(d.target_id)}` : ''}</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${esc(c.text || '')}</div>
+      ${scoreNames.map(k => {
+        const v = (scores[k] || 0).toFixed(3);
+        const pct = Math.round((scores[k]||0)*100);
+        return `<div class="score-row">
+          <div class="score-label">${k.replace(/_/g,' ')}</div>
+          <div class="score-bar"><div class="score-fill" style="width:${pct}%"></div></div>
+          <div class="score-val">${v}</div>
+        </div>`;
+      }).join('')}
+      ${!c.ok ? `<div style="font-size:11px;color:var(--red);margin-top:6px">Error: ${esc(c.error||'')}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Timeline ─────────────────────────────────────────────────────────────────
+async function refreshTimeline() {
+  try {
+    const r = await fetch(`${API}/api/timeline`);
+    const d = await r.json();
+    renderTimeline(d.events || []);
+  } catch(e) {}
+}
+
+function renderTimeline(events) {
+  const el = document.getElementById('timeline-list');
+  if (!events.length) { el.innerHTML = '<div class="empty-state">No memory events yet.</div>'; return; }
+  const colors = {ADD: 'var(--green)', UPDATE: 'var(--yellow)', DELETE: 'var(--red)', NOOP: 'var(--muted)'};
+  el.innerHTML = [...events].reverse().map(e => `
+    <div class="timeline-event">
+      <div class="tl-action" style="color:${colors[e.action]||'var(--muted)'}">${e.action}</div>
+      <div class="tl-text">${esc(e.candidate_text||e.candidate_id||'')}</div>
+      <div class="tl-ts">${esc((e.ts||'').substring(11,19))}</div>
+    </div>`).join('');
+}
+
+// ── Capacity ─────────────────────────────────────────────────────────────────
+function updateCapacity(counts, stmCap, mtmCap) {
+  const el = document.getElementById('capacity-content');
+  const tiers = [
+    {name:'STM', count: counts.STM||0, cap: stmCap||20, desc:'Short-term memory'},
+    {name:'MTM', count: counts.MTM||0, cap: mtmCap||100, desc:'Mid-term memory'},
+    {name:'LTM', count: counts.LTM||0, cap: null, desc:'Long-term memory (unbounded)'},
+  ];
+  el.innerHTML = tiers.map(t => {
+    const pct = t.cap ? Math.min(100, Math.round(t.count/t.cap*100)) : 0;
+    const cls = pct >= 90 ? 'full' : pct >= 70 ? 'warn' : '';
+    return `<div class="cap-row" style="margin-bottom:14px">
+      <div class="cap-label">
+        <span><span class="tier-badge tier-${t.name}">${t.name}</span> ${t.desc}</span>
+        <span>${t.count}${t.cap ? ' / ' + t.cap : ''}</span>
+      </div>
+      ${t.cap ? `<div class="cap-bar"><div class="cap-fill ${cls}" style="width:${pct}%"></div></div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Reset ────────────────────────────────────────────────────────────────────
+function showResetModal() { document.getElementById('modal-overlay').classList.add('visible'); }
+function hideModal() { document.getElementById('modal-overlay').classList.remove('visible'); }
+async function doReset() {
+  hideModal();
+  await fetch(`${API}/api/memories?confirm=true`, {method:'DELETE'});
+  document.getElementById('messages').innerHTML = '';
+  addMessage('All memories have been reset.', 'system');
+  refreshMemories();
+  checkHealth();
+  refreshTimeline();
+}
+
+// ── Tabs ─────────────────────────────────────────────────────────────────────
+function switchTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+  if (name === 'timeline') refreshTimeline();
+}
+
+// ── Error banner ──────────────────────────────────────────────────────────────
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.style.display = 'none', 5000);
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+(async () => {
+  await checkHealth();
+  await refreshMemories();
+  await refreshTimeline();
+  // Sample messages hint
+  addMessage('👋 Demo mode. Try: "I live in Chennai." → then "Where do I live?" Watch the Decisions and Timeline tabs update.', 'system');
+})();
+</script>
+</body>
+</html>

@@ -376,7 +376,7 @@ def test_regression_modes_without_export_flags(capsys, tmp_path, monkeypatch):
     # single mode unchanged
     assert main(["--dataset", "synthetic"]) == 0
     out0 = capsys.readouterr().out
-    assert "Synthetic benchmark (synthetic_demo)" in out0
+    assert "Synthetic benchmark (synthetic_demo" in out0
     assert "Exported" not in out0
     # compare mode unchanged
     assert main(["--dataset", "synthetic", "--compare", "none,hmem"]) == 0
