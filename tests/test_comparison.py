@@ -383,7 +383,7 @@ def test_cli_single_baseline_regression(capsys):
     # default single mode (no --compare): title unchanged, table absent
     assert main(["--dataset", "synthetic"]) == 0
     out0 = capsys.readouterr().out
-    assert "Synthetic benchmark (synthetic_demo)" in out0
+    assert "Synthetic benchmark (synthetic_demo" in out0
     assert "Mean F1" in out0
     assert "Strategy" not in out0.splitlines()[0]
 

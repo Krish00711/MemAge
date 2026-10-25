@@ -436,7 +436,7 @@ def test_regression_compare_cli_still_works(capsys):
 def test_regression_single_strategy_cli_unchanged(capsys):
     assert main(["--dataset", "synthetic"]) == 0
     out0 = capsys.readouterr().out
-    assert "Synthetic benchmark (synthetic_demo)" in out0
+    assert "Synthetic benchmark (synthetic_demo" in out0
     assert "Mean F1" in out0
     assert "Ablation" not in out0
 

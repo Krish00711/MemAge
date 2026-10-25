@@ -38,6 +38,7 @@ from src.eval.ablation import (
     run_ablation,
     stage_configs,
 )
+from src.eval.signal_ablation import signal_configs, SIGNAL_NAMES
 from src.eval.baselines import (
     FullHistoryBaseline,
     HMemBaseline,
@@ -223,6 +224,31 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: the repository data/ folder)."
         ),
     )
+    parser.add_argument(
+        "--sample",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="Limit evaluation to the first N cases (default: all).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="SEED",
+        help="Random seed for reproducibility (recorded in metadata; no shuffling).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Write per-example predictions (predictions.json) and aggregate "
+            "results (results.json, results.csv) to this directory. "
+            "Directory is created if it does not exist."
+        ),
+    )
     return parser
 
 
@@ -354,61 +380,118 @@ def _synthetic_answer(query: str, context: str) -> str:
 
 
 def run_synthetic_demo(
-    k: int = 5, token_budget: int = DEFAULT_TOKEN_BUDGET, baseline: str = "none"
+    k: int = 5,
+    token_budget: int = DEFAULT_TOKEN_BUDGET,
+    baseline: str = "none",
+    sample: Optional[int] = None,
+    seed: Optional[int] = None,
+    output_dir: Optional[str] = None,
 ) -> int:
     """Run the synthetic benchmark (no network, no store, no API keys).
-
-    Baselines:
-        * ``none`` - the real two-stage pipeline (``RetrievalContext``) over
-          an in-memory store; ``token_budget`` is passed through to it via
-          ``make_retrieval_fn``.
-        * ``full_history`` - the entire history as context, no retrieval
-          (``FullHistoryBaseline``); ``token_budget`` does not apply.
-        * ``memoryos`` - tiered STM/LTM approximation (``MemoryOSBaseline``);
-          selects top-``k`` entries by lexical overlap; ``token_budget`` does
-          not apply.
-        * ``memory_r1`` - budgeted ranked approximation (``MemoryR1Baseline``);
-          ranks the whole history lexically, then enforces ``token_budget``
-          via the repository's greedy budget selector.
-        * ``hmem`` - hierarchical approximation (``HMemBaseline``); orders
-          candidates tier-first (STM/MTM/LTM coarse-to-fine), then enforces
-          ``token_budget`` via the same greedy budget selector.
 
     Returns exit code 0.
     """
     dataset = BenchmarkDataset.from_synthetic(_SYNTHETIC_CASES, name="synthetic_demo")
+    if sample is not None:
+        dataset = BenchmarkDataset(cases=list(dataset.cases)[:sample], name=dataset.name)
 
     if baseline == "full_history":
         retrieval_fn = FullHistoryBaseline(_SYNTHETIC_MEMORIES)
-        title = f"Synthetic benchmark ({dataset.name}, baseline={baseline})"
     elif baseline == "memoryos":
-        # ``--k`` doubles as the baseline's selection size (metric cutoff
-        # stays k as well, matching the BenchmarkRunner contract).
         retrieval_fn = MemoryOSBaseline(_SYNTHETIC_MEMORIES, k=k)
-        title = f"Synthetic benchmark ({dataset.name}, baseline={baseline})"
     elif baseline == "memory_r1":
-        retrieval_fn = MemoryR1Baseline(
-            _SYNTHETIC_MEMORIES, token_budget=token_budget
-        )
-        title = f"Synthetic benchmark ({dataset.name}, baseline={baseline})"
+        retrieval_fn = MemoryR1Baseline(_SYNTHETIC_MEMORIES, token_budget=token_budget)
     elif baseline == "hmem":
         retrieval_fn = HMemBaseline(_SYNTHETIC_MEMORIES, token_budget=token_budget)
-        title = f"Synthetic benchmark ({dataset.name}, baseline={baseline})"
     else:
         retrieval_fn = make_retrieval_fn(_synthetic_pipeline(), token_budget)
-        title = f"Synthetic benchmark ({dataset.name})"
 
-    runner = BenchmarkRunner(
-        retrieval_fn=retrieval_fn, answer_fn=_synthetic_answer, k=k
-    )
+    runner = BenchmarkRunner(retrieval_fn=retrieval_fn, answer_fn=_synthetic_answer, k=k)
     report = runner.run_dataset(dataset)
+    title = f"Synthetic benchmark ({dataset.name}, baseline={baseline})"
     _print_report(report, k, title)
+    _save_run(report, output_dir=output_dir, dataset="synthetic", baseline=baseline,
+              token_budget=token_budget, k=k, sample=sample, seed=seed)
     return 0
 
 
 # ---------------------------------------------------------------------------
 # Comparison mode (orchestration lives in src/eval/comparison.py)
 # ---------------------------------------------------------------------------
+
+
+def _save_run(
+    report,
+    output_dir: Optional[str],
+    dataset: str,
+    baseline: str,
+    token_budget: int,
+    k: int,
+    sample: Optional[int] = None,
+    seed: Optional[int] = None,
+) -> None:
+    """Write per-example predictions and aggregate results to *output_dir*."""
+    if output_dir is None:
+        return
+    import json as _json
+    import time as _time
+    from dataclasses import asdict
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    meta = {
+        "dataset": dataset,
+        "baseline": baseline,
+        "token_budget": token_budget,
+        "k": k,
+        "sample": sample,
+        "seed": seed,
+        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "llm_provider": __import__("os").environ.get("LLM_PROVIDER", ""),
+    }
+
+    # Per-example predictions
+    predictions = []
+    for r in report.per_case:
+        predictions.append({
+            "case_id": r.case_id,
+            "query": r.query,
+            "predicted_answer": r.predicted_answer,
+            "reference_answer": r.reference_answer,
+            "f1": r.f1,
+            "bleu1": r.bleu1,
+            "latency_ms": r.latency_ms,
+            "tokens": r.tokens,
+            "retrieval_recall": r.retrieval_recall,
+            "retrieval_precision": r.retrieval_precision,
+            "retrieval_rr": r.retrieval_rr,
+            "retrieved_ids": r.retrieved_ids,
+            "relevant_ids": r.relevant_ids,
+        })
+    pred_path = out / "predictions.json"
+    pred_path.write_text(
+        _json.dumps({"meta": meta, "predictions": predictions}, indent=2),
+        encoding="utf-8",
+    )
+
+    # Aggregate results
+    agg = {
+        "meta": meta,
+        "results": {
+            "num_queries": report.num_queries,
+            "mean_f1": report.mean_f1,
+            "mean_bleu1": report.mean_bleu1,
+            "mean_latency_ms": report.mean_latency_ms,
+            "mean_tokens": report.mean_tokens,
+            "mean_recall_at_k": report.mean_recall_at_k,
+            "mean_precision_at_k": report.mean_precision_at_k,
+            "mrr": report.mrr,
+        },
+    }
+    results_path = out / "results.json"
+    results_path.write_text(_json.dumps(agg, indent=2), encoding="utf-8")
+    print(f"Saved predictions → {pred_path}")
+    print(f"Saved results     → {results_path}")
 
 
 def _export_result(result, export_json: Optional[str], export_csv: Optional[str]) -> Optional[int]:
@@ -582,25 +665,79 @@ def run_synthetic_ablation(
 
 
 def _build_strategy(baseline: str, token_budget: int, data_dir: Optional[str]):
-    """Build ``(retrieval_fn, answer_fn)`` for a real dataset — or ``None``.
+    """Build ``(retrieval_fn, answer_fn)`` for a real dataset.
 
-    Once ``src/store`` (tiered memory store) and ``src/llm`` (``call_llm``)
-    are available, this constructs the real strategy:
+    The four history-based baselines (full_history, memoryos, memory_r1, hmem)
+    use ``history_from_case`` to derive per-case context from adapter metadata
+    and ``call_llm`` for answer generation.  The ``none`` (our system) baseline
+    requires a live store and is not implemented here.
 
-        ctx = RetrievalContext(CoarseRetriever(store), LLMReranker(call_llm), ...)
-        retrieval_fn = make_retrieval_fn(ctx, token_budget)   # budget passes here
-        answer_fn = lambda q, context: call_llm(...)
-
-    For ``full_history``, ``memoryos``, ``memory_r1``, and ``hmem`` the
-    retrieval side needs no store — the context can be built per case from
-    adapter metadata via the baselines in ``src/eval/baselines.py`` — but
-    answer generation still requires ``src/llm``.
-
-    Neither module exists yet (owned by teammates), so no strategy can be
-    constructed without inventing interfaces. The dataset loading path above
-    is fully exercised regardless.
+    Returns ``(retrieval_fn, answer_fn)`` or ``None`` if unavailable.
     """
-    return None
+    # Our system baseline requires a real store — not wired yet.
+    if baseline == "none":
+        return None
+
+    # All history-based baselines need call_llm for answer generation.
+    try:
+        from src.llm.client import call_llm
+    except ImportError:
+        return None
+
+    from src.eval.baselines import (
+        history_from_case,
+        full_history_retrieval_fn,
+        memoryos_retrieval_fn,
+        memory_r1_retrieval_fn,
+        hmem_retrieval_fn,
+    )
+    from src.eval.dataset import BenchmarkCase
+    from src.eval.benchmark import RetrievalOutcome
+
+    _ANSWER_SYSTEM = (
+        "You are a helpful assistant with access to conversation history. "
+        "Answer concisely using only the provided context. "
+        "If the context does not contain the answer, say you don't know."
+    )
+
+    def _answer_fn(query: str, context: str) -> str:
+        if context.strip():
+            prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
+        else:
+            prompt = f"Question: {query}\nAnswer (no relevant context available):"
+        try:
+            return call_llm(prompt, system=_ANSWER_SYSTEM)
+        except Exception as exc:
+            return f"[LLM error: {exc}]"
+
+    # Per-case retrieval: build baseline from this case's history each time.
+    def _make_retrieval_fn(case: BenchmarkCase, bsl: str, budget: int):
+        history = history_from_case(case)
+        if bsl == "full_history":
+            return full_history_retrieval_fn(history)
+        if bsl == "memoryos":
+            return memoryos_retrieval_fn(history)
+        if bsl == "memory_r1":
+            return memory_r1_retrieval_fn(history, token_budget=budget)
+        if bsl == "hmem":
+            return hmem_retrieval_fn(history, token_budget=budget)
+        raise ValueError(f"Unknown baseline: {bsl}")
+
+    # Closure captures the per-case retrieval function.
+    # BenchmarkRunner calls retrieval_fn(query), so we need to stash the
+    # current case. We inject via memory_prepare_fn which sets _current_case.
+    state: dict = {"retrieval_fn": None}
+
+    def memory_prepare(case: BenchmarkCase) -> None:
+        state["retrieval_fn"] = _make_retrieval_fn(case, baseline, token_budget)
+
+    def retrieval_fn(query: str) -> RetrievalOutcome:
+        fn = state.get("retrieval_fn")
+        if fn is None:
+            return RetrievalOutcome(context="", retrieved_ids=None, tokens=0)
+        return fn(query)
+
+    return retrieval_fn, _answer_fn, memory_prepare
 
 
 def run_dataset_benchmark(
@@ -609,13 +746,11 @@ def run_dataset_benchmark(
     k: int,
     token_budget: int,
     data_dir: Optional[str] = None,
+    sample: Optional[int] = None,
+    seed: Optional[int] = None,
+    output_dir: Optional[str] = None,
 ) -> int:
-    """Load a real dataset, report it, and benchmark if a strategy exists.
-
-    Returns:
-        0 on success, 1 on dataset format errors, 2 when the strategy
-        (retrieval store / LLM) is not yet available.
-    """
+    """Load a real dataset, report it, and benchmark if a strategy exists."""
     try:
         loaded = load_dataset(dataset, data_dir=data_dir)
     except DatasetFileNotFoundError as exc:
@@ -626,52 +761,34 @@ def run_dataset_benchmark(
         return 1
 
     path = resolve_dataset_file(dataset, data_dir)
-    print(f"Loaded {dataset}: {len(loaded)} cases from {path}")
+    total = len(loaded)
+    if sample is not None:
+        from src.eval.dataset import BenchmarkDataset as _BD
+        loaded = _BD(cases=list(loaded.cases)[:sample], name=loaded.name)
+    print(f"Loaded {dataset}: {total} cases from {path}"
+          + (f" (using first {len(loaded)})" if sample else ""))
 
     strategy = _build_strategy(baseline, token_budget, data_dir)
     if strategy is None:
-        if baseline == "full_history":
-            reason = (
-                "the full-history context can be built from dataset metadata "
-                "(src/eval/baselines.py) but answer generation still requires "
-                "src/llm (call_llm), which is not implemented yet"
-            )
-        elif baseline == "memoryos":
-            reason = (
-                "the tiered-memory context can be built from dataset metadata "
-                "(src/eval/baselines.py) but answer generation still requires "
-                "src/llm (call_llm), which is not implemented yet"
-            )
-        elif baseline == "memory_r1":
-            reason = (
-                "the budgeted-ranked context can be built from dataset metadata "
-                "(src/eval/baselines.py) but answer generation still requires "
-                "src/llm (call_llm), which is not implemented yet"
-            )
-        elif baseline == "hmem":
-            reason = (
-                "the hierarchical context can be built from dataset metadata "
-                "(src/eval/baselines.py) but answer generation still requires "
-                "src/llm (call_llm), which is not implemented yet"
-            )
-        else:
-            reason = (
-                "building the retrieval/answer strategy requires src/store "
-                "(tiered memory store) and src/llm (call_llm), which are not "
-                "implemented yet"
-            )
         print(
-            f"Error: cannot execute baseline '{baseline}' yet - {reason}. "
-            f"Dataset parsing succeeded ({len(loaded)} cases, "
-            f"token_budget={token_budget}).",
+            f"Error: cannot execute baseline '{baseline}' on real data yet — "
+            f"requires src/store (TieredMemoryStore + chromadb). "
+            f"Dataset parsing succeeded ({total} cases).",
             file=sys.stderr,
         )
         return 2
 
-    retrieval_fn, answer_fn = strategy
-    runner = BenchmarkRunner(retrieval_fn=retrieval_fn, answer_fn=answer_fn, k=k)
+    retrieval_fn, answer_fn, memory_prepare_fn = strategy
+    runner = BenchmarkRunner(
+        retrieval_fn=retrieval_fn,
+        answer_fn=answer_fn,
+        memory_prepare_fn=memory_prepare_fn,
+        k=k,
+    )
     report = runner.run_dataset(loaded)
     _print_report(report, k, f"Benchmark ({dataset}, baseline={baseline})")
+    _save_run(report, output_dir=output_dir, dataset=dataset, baseline=baseline,
+              token_budget=token_budget, k=k, sample=sample, seed=seed)
     return 0
 
 
@@ -780,10 +897,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1
             ablation = "k" if kind == "k" else "token_budget"
+        elif kind == "signal":
+            if not raw:
+                print(
+                    f"Error: --ablate signal requires a signal name, e.g. "
+                    f"--ablate signal:importance  (choices: {sorted(SIGNAL_NAMES)})",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                configs = signal_configs(raw)
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            ablation = f"signal:{raw}"
         else:
             print(
                 f"Error: unknown ablation kind {kind!r}. "
-                f"Supported: stage, k, budget",
+                f"Supported: stage, k, budget, signal",
                 file=sys.stderr,
             )
             return 1
@@ -813,7 +944,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dataset == "synthetic":
         return run_synthetic_demo(
-            k=args.k, token_budget=args.token_budget, baseline=args.baseline
+            k=args.k,
+            token_budget=args.token_budget,
+            baseline=args.baseline,
+            sample=args.sample,
+            seed=args.seed,
+            output_dir=args.output_dir,
         )
 
     return run_dataset_benchmark(
@@ -822,6 +958,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         k=args.k,
         token_budget=args.token_budget,
         data_dir=args.data_dir,
+        sample=args.sample,
+        seed=args.seed,
+        output_dir=args.output_dir,
     )
 
 

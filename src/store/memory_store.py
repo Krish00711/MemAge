@@ -1,13 +1,85 @@
 """Tiered memory store (STM / MTM / LTM) backed by ChromaDB.
 
 Owner: Aryan. Interface contract: docs/interfaces.md
+
+Embedding note
+--------------
+By default the store uses ``sentence-transformers`` (all-MiniLM-L6-v2).
+On disk-constrained machines use the bundled FastEmbedAdapter instead:
+
+    from src.store.embed_adapter import FastEmbedAdapter
+    store = TieredMemoryStore(embedder=FastEmbedAdapter())
+
+Or inject any object with an ``encode(text: str) -> Iterable[float]`` method.
+``sentence-transformers`` is NOT imported at module level so that the store
+can be imported and injected with a custom embedder without it being installed.
 """
 from __future__ import annotations
-
-import chromadb
-from sentence_transformers import SentenceTransformer
+# chromadb will be imported lazily in TieredMemoryStore.__init__
 
 TIERS = ("STM", "MTM", "LTM")
+
+# Simple in‑memory collection used when chromadb is unavailable.
+class _InMemoryCollection:
+    def __init__(self):
+        self._items: dict[str, dict] = {}
+
+    def add(self, ids, documents, embeddings=None, metadatas=None):
+        for i, _id in enumerate(ids):
+            self._items[_id] = {
+                "document": documents[i] if documents else "",
+                "embedding": embeddings[i] if embeddings else None,
+                "metadata": metadatas[i] if metadatas else {},
+            }
+
+    def delete(self, ids):
+        for _id in ids:
+            self._items.pop(_id, None)
+
+    def update(self, ids, documents=None, embeddings=None, metadatas=None):
+        for i, _id in enumerate(ids):
+            if _id not in self._items:
+                continue
+            if documents:
+                self._items[_id]["document"] = documents[i]
+            if embeddings:
+                self._items[_id]["embedding"] = embeddings[i]
+            if metadatas:
+                self._items[_id]["metadata"] = metadatas[i]
+
+    def get(self, ids, include=None):
+        include = include or []
+        result = {"ids": [], "documents": [], "embeddings": [], "metadatas": []}
+        for _id in ids:
+            item = self._items.get(_id)
+            if item:
+                result["ids"].append(_id)
+                if "documents" in include:
+                    result["documents"].append(item["document"])
+                if "embeddings" in include:
+                    result["embeddings"].append(item["embedding"])
+                if "metadatas" in include:
+                    result["metadatas"].append(item["metadata"])
+        return result
+
+    def query(self, query_embeddings, n_results):
+        query_vec = query_embeddings[0]
+        distances = []
+        for _id, item in self._items.items():
+            emb = item.get("embedding")
+            if emb is None:
+                continue
+            dist = sum((a - b) ** 2 for a, b in zip(emb, query_vec))
+            distances.append((dist, _id))
+        distances.sort(key=lambda x: x[0])
+        top = distances[:n_results]
+        ids = [i for _, i in top]
+        docs = [self._items[i]["document"] for i in ids]
+        embs = [self._items[i]["embedding"] for i in ids]
+        return {"ids": [ids], "documents": [docs], "embeddings": [embs], "distances": [[d for d, _ in top]]}
+
+    def count(self):
+        return len(self._items)
 
 # Tier rules: tune these during benchmarking
 STM_CAPACITY = 20           # newest memories live here
@@ -20,22 +92,55 @@ class TieredMemoryStore:
                  stm_capacity: int = STM_CAPACITY,
                  mtm_capacity: int = MTM_CAPACITY,
                  ltm_access_threshold: int = LTM_ACCESS_THRESHOLD):
-        self._client = chromadb.PersistentClient(path=persist_dir)
-        self._embedder = embedder or SentenceTransformer("all-MiniLM-L6-v2")
+        # Lazy import of chromadb; if unavailable, use an in‑memory fallback
+        try:
+            import chromadb
+            self._client = chromadb.PersistentClient(path=persist_dir)
+        except ImportError:
+            # No chromadb installed – use a simple in‑memory store
+            self._client = None
+            self._cols = {tier: _InMemoryCollection() for tier in TIERS}
+        # Embedder handling
+        if embedder is None:
+            # Try sentence-transformers first
+            try:
+                from sentence_transformers import SentenceTransformer  # type: ignore[import]
+                embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            except ImportError:
+                # Fallback: try fastembed via the adapter (proper import, not sys.modules hack)
+                try:
+                    from src.store.embed_adapter import FastEmbedAdapter  # type: ignore[import]
+                    embedder = FastEmbedAdapter()
+                except ImportError:
+                    raise ImportError(
+                        "Neither sentence-transformers nor fastembed is installed and no embedder was injected. "
+                        "Install fastembed (pip install fastembed) or pass an embedder object with an "
+                        "encode(text: str) -> list[float] method to TieredMemoryStore()."
+                    )
+        self._embedder = embedder
         self.stm_capacity = stm_capacity
         self.mtm_capacity = mtm_capacity
         self.ltm_access_threshold = ltm_access_threshold
-        # One Chroma collection per tier
-        self._cols = {
-            tier: self._client.get_or_create_collection(
-                name=tier.lower(), metadata={"hnsw:space": "cosine"}
-            )
-            for tier in TIERS
-        }
+        # Initialize collections based on backend availability
+        if self._client is not None:
+            self._cols = {
+                tier: self._client.get_or_create_collection(
+                    name=tier.lower(), metadata={"hnsw:space": "cosine"}
+                )
+                for tier in TIERS
+            }
+        else:
+            # In‑memory fallback collections already set
+            pass
 
     # ---------- helpers ----------
     def _embed(self, text: str) -> list[float]:
-        return self._embedder.encode(text).tolist()
+        result = self._embedder.encode(text)
+        # SentenceTransformer returns a numpy array (.tolist() method exists).
+        # An injected lightweight embedder may return a plain list directly.
+        if hasattr(result, "tolist"):
+            return result.tolist()
+        return list(result)
 
     def _find(self, item_id: str):
         """Return (tier, record) for an id, or (None, None) if not stored."""
