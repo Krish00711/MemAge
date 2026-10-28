@@ -179,11 +179,72 @@ def _read_json_array(path: Union[str, Path]) -> list:
     return raw
 
 
+def _coerce_answer(value) -> Optional[str]:
+    """Normalize a dataset answer field to a stripped string, or ``None``.
+
+    The official releases store some answers as JSON numbers (e.g. ``2022``,
+    ``2``) rather than strings; those are valid ground truth and must not be
+    dropped.  Booleans and non-scalar values are rejected.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # LoCoMo
 # ---------------------------------------------------------------------------
 
 _SESSION_KEY_RE = re.compile(r"^session_(\d+)$")
+
+
+def _repair_locomo_id(eid: str, valid_ids: set) -> str:
+    """Canonicalize a mistyped LoCoMo dia_id when the fixed form exists.
+
+    Handles the two typos present in the provided release (``D:11:26``
+    misplaced colon, ``D30:05`` zero-padded counter).  A candidate is
+    accepted only if it is a real turn id of this conversation, so a broken
+    annotation can never be remapped onto the wrong turn; unrepairable ids
+    are returned unchanged.
+    """
+    m = re.match(r"^D:(\d+):(\d+)$", eid)
+    if m:
+        cand = f"D{m.group(1)}:{m.group(2)}"
+        if cand in valid_ids:
+            return cand
+    m = re.match(r"^(D\d+:)0+(\d+)$", eid)
+    if m:
+        cand = f"{m.group(1)}{int(m.group(2))}"
+        if cand in valid_ids:
+            return cand
+    return eid
+
+
+def _locomo_relevant_ids(evidence: list, valid_ids: set) -> List[str]:
+    """Map raw ``qa[].evidence`` to turn dia_ids of this conversation.
+
+    The provided release contains composite elements — ``"D8:6; D9:17"``
+    and space-joined lists like ``"D9:1 D4:4 D4:6"`` — so elements are
+    split on ``;`` and whitespace.  Each part is existence-checked and
+    typo-repaired against *valid_ids*; ids that do not correspond to any
+    turn are kept as-is (annotation errors in the dataset).
+    """
+    out: List[str] = []
+    for item in evidence:
+        if item is None:
+            continue
+        for part in re.split(r"[;\s]+", str(item)):
+            part = part.strip()
+            if not part:
+                continue
+            if part not in valid_ids:
+                part = _repair_locomo_id(part, valid_ids)
+            out.append(part)
+    return out
 
 
 def _locomo_turns(conversation: dict) -> List[dict]:
@@ -267,6 +328,7 @@ def load_locomo(
             )
         sample_id = str(sample.get("sample_id") or f"sample_{sample_idx}")
         turns = _locomo_turns(conversation)
+        valid_ids = {t["id"] for t in turns if t.get("id")}
 
         for qa_idx, entry in enumerate(qa):
             if not isinstance(entry, dict):
@@ -286,10 +348,10 @@ def load_locomo(
                     qa_idx,
                 )
                 continue
-            answer = entry.get("answer")
-            if not isinstance(answer, str) or not answer.strip():
-                answer = entry.get("adversarial_answer")
-            if not isinstance(answer, str) or not answer.strip():
+            answer = _coerce_answer(entry.get("answer"))
+            if answer is None:
+                answer = _coerce_answer(entry.get("adversarial_answer"))
+            if answer is None:
                 skipped += 1
                 logger.warning(
                     "LoCoMo %s qa[%d] missing 'answer'/'adversarial_answer'; "
@@ -307,13 +369,11 @@ def load_locomo(
                     qa_idx,
                 )
                 continue
-            relevant_ids = [
-                str(e) for e in evidence if e is not None and str(e).strip()
-            ]
+            relevant_ids = _locomo_relevant_ids(evidence, valid_ids)
             cases.append(
                 BenchmarkCase(
                     query=question.strip(),
-                    reference_answer=answer.strip(),
+                    reference_answer=answer,
                     relevant_ids=relevant_ids,
                     case_id=f"{sample_id}::qa{qa_idx}",
                     metadata={
@@ -441,8 +501,8 @@ def load_longmemeval(
         if not isinstance(question, str) or not question.strip():
             _skip("missing 'question'")
             continue
-        answer = row.get("answer")
-        if not isinstance(answer, str) or not answer.strip():
+        answer = _coerce_answer(row.get("answer"))
+        if answer is None:
             _skip("missing 'answer'")
             continue
         if not isinstance(row.get("haystack_sessions"), list):
@@ -461,7 +521,7 @@ def load_longmemeval(
         cases.append(
             BenchmarkCase(
                 query=question.strip(),
-                reference_answer=answer.strip(),
+                reference_answer=answer,
                 relevant_ids=[str(a) for a in answer_ids if a is not None],
                 case_id=question_id,
                 metadata={

@@ -124,11 +124,11 @@ def check() -> int:  # returns 0 = ok, 1 = problems found
         free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
         print(f"  Free space: {free_gb:.1f} GB")
         if free_gb < 1.0:
-            print("  [WARNING] Less than 1 GB free — sentence-transformers model may not fit.")
+            print("  [WARNING] Less than 1 GB free - sentence-transformers model may not fit.")
             print("            Consider fastembed (pip install fastembed==0.3.6, ~30 MB).")
             ok = False
         elif free_gb < 0.5:
-            print("  [ERROR] Less than 500 MB free — installation will likely fail.")
+            print("  [ERROR] Less than 500 MB free - installation will likely fail.")
             ok = False
     except Exception:
         print("  (could not determine disk space)")
@@ -145,7 +145,7 @@ def check() -> int:  # returns 0 = ok, 1 = problems found
     if ok:
         print("All required settings are present.")
     else:
-        print("One or more required settings are missing — see above.")
+        print("One or more required settings are missing - see above.")
     return 0 if ok else 1
 
 

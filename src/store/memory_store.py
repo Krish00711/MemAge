@@ -47,19 +47,22 @@ class _InMemoryCollection:
             if metadatas:
                 self._items[_id]["metadata"] = metadatas[i]
 
-    def get(self, ids, include=None):
-        include = include or []
-        result = {"ids": [], "documents": [], "embeddings": [], "metadatas": []}
-        for _id in ids:
-            item = self._items.get(_id)
-            if item:
-                result["ids"].append(_id)
-                if "documents" in include:
-                    result["documents"].append(item["document"])
-                if "embeddings" in include:
-                    result["embeddings"].append(item["embedding"])
-                if "metadatas" in include:
-                    result["metadatas"].append(item["metadata"])
+    def get(self, ids=None, include=None):
+        # Chroma semantics: ids optional (None -> whole collection), and the
+        # default include is ["metadatas", "documents"].
+        if include is None:
+            include = ["metadatas", "documents"]
+        if ids is None:
+            selected = list(self._items.items())
+        else:
+            selected = [(i, self._items[i]) for i in ids if i in self._items]
+        result = {"ids": [i for i, _ in selected]}
+        if "documents" in include:
+            result["documents"] = [item["document"] for _, item in selected]
+        if "embeddings" in include:
+            result["embeddings"] = [item["embedding"] for _, item in selected]
+        if "metadatas" in include:
+            result["metadatas"] = [dict(item["metadata"]) for _, item in selected]
         return result
 
     def query(self, query_embeddings, n_results):
@@ -76,7 +79,9 @@ class _InMemoryCollection:
         ids = [i for _, i in top]
         docs = [self._items[i]["document"] for i in ids]
         embs = [self._items[i]["embedding"] for i in ids]
-        return {"ids": [ids], "documents": [docs], "embeddings": [embs], "distances": [[d for d, _ in top]]}
+        metas = [dict(self._items[i]["metadata"]) for i in ids]
+        return {"ids": [ids], "documents": [docs], "embeddings": [embs],
+                "metadatas": [metas], "distances": [[d for d, _ in top]]}
 
     def count(self):
         return len(self._items)

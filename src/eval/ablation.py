@@ -231,7 +231,9 @@ def run_ablation(
             enforced by the underlying comparison as well).
         strategy_builder: ``(AblationConfig) -> StrategySpec`` producing the
             strategy for one config (its spec name is overridden by the
-            config label; its ``retrieval_fn``/``answer_fn`` are kept).
+            config label; its ``retrieval_fn``/``answer_fn``/
+            ``memory_prepare_fn`` are kept — the latter lets real-dataset
+            configs prepare per-case state, e.g. an isolated store).
         answer_fn: Shared ``(query, context) -> answer`` for configs whose
             spec does not carry its own.
         k: Metric cutoff for every runner (kept FIXED across configs so the
@@ -279,6 +281,7 @@ def run_ablation(
                 name=cfg.label,
                 retrieval_fn=spec.retrieval_fn,
                 answer_fn=spec.answer_fn,
+                memory_prepare_fn=spec.memory_prepare_fn,
             )
         )
 

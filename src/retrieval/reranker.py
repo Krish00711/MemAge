@@ -92,13 +92,34 @@ _SYSTEM_PROMPT = (
     "to the query."
 )
 
+# Per-candidate text caps for the rerank prompt.  Real datasets carry
+# session-level memories of tens of thousands of characters; sending them
+# verbatim produced 100k+ token prompts that providers reject (Groq 413 /
+# TPM overflow), silently degrading Stage-2 to the lexical fallback.
+_PROMPT_TEXT_MAX_WORDS = 64
+_PROMPT_TEXT_MAX_CHARS = 600
+
+
+def _truncate_for_prompt(text: str) -> str:
+    """Bound *text* for the rerank prompt (word cap, then hard char cap)."""
+    if not isinstance(text, str):
+        return ""
+    words = text.split()
+    if len(words) > _PROMPT_TEXT_MAX_WORDS:
+        text = " ".join(words[:_PROMPT_TEXT_MAX_WORDS])
+    if len(text) > _PROMPT_TEXT_MAX_CHARS:
+        text = text[:_PROMPT_TEXT_MAX_CHARS]
+    return text
+
 
 def _build_prompt(query: str, candidates: List[CandidateMemoryItem]) -> str:
     """Construct a deterministic ranking prompt.
 
     The prompt contains the query and for each candidate its id, text,
     timestamp, and source.  It instructs the LLM to output structured JSON
-    and to obey the no-invention constraints.
+    and to obey the no-invention constraints.  Candidate text is truncated
+    via :func:`_truncate_for_prompt` so the prompt stays within provider
+    request limits regardless of memory size.
     """
     lines: List[str] = []
     lines.append("You are a relevance reranker for a selective long-term memory system.")
@@ -110,7 +131,7 @@ def _build_prompt(query: str, candidates: List[CandidateMemoryItem]) -> str:
     lines.append(f"Candidates ({len(candidates)}):")
     for item in candidates:
         cid = item.get("id", "")
-        text = item.get("text", "")
+        text = _truncate_for_prompt(item.get("text", ""))
         timestamp = item.get("timestamp", "")
         source = item.get("source", "")
         lines.append(f'- ID: {cid}')

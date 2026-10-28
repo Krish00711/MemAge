@@ -27,6 +27,7 @@ from src.eval.baselines import (
     full_history_retrieval_fn,
     history_from_case,
     hmem_retrieval_fn,
+    memory_entries_from_case,
     memory_r1_retrieval_fn,
     memoryos_retrieval_fn,
 )
@@ -110,6 +111,7 @@ __all__ = [
     "full_history_retrieval_fn",
     "history_from_case",
     "hmem_retrieval_fn",
+    "memory_entries_from_case",
     "memory_r1_retrieval_fn",
     "memoryos_retrieval_fn",
     "recall_at_k",

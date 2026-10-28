@@ -67,7 +67,7 @@ def main():
     print(f"\n=== MemAge smoke test  (store: {persist_dir}) ===\n")
 
     # ------------------------------------------------------------------ Turn 1
-    print("Step 1: Ingest turn 1 — initial city fact")
+    print("Step 1: Ingest turn 1 - initial city fact")
     from src.pipeline import run_turn
     from src.llm.client import call_llm
 
@@ -84,7 +84,7 @@ def main():
         sys.exit(1)
 
     # ------------------------------------------------------------------ Turn 2
-    print("Step 2: Ingest turn 2 — correction (moved to Bangalore)")
+    print("Step 2: Ingest turn 2 - correction (moved to Bangalore)")
     meta2 = {"speaker": "Maya", "timestamp": "2026-06-01T09:00:00", "source": "smoke:2"}
     r2 = run_turn("I moved to Bangalore last month.", meta2, store=store, llm=call_llm)
     if r2.candidates:
@@ -101,18 +101,18 @@ def main():
     counts = store2.count()
     print(f"  Counts after reload: {counts}")
     total = sum(counts.values())
-    assert total > 0, "Store is empty after reload — persistence failed"
+    assert total > 0, "Store is empty after reload - persistence failed"
 
     # ------------------------------------------------------------------ Query
     print("Step 4: Query for city-related memory")
     results = store2.query("Where does Maya live?", k=3, tier="all")
     print(f"  Retrieved {len(results)} memory/memories")
-    assert len(results) > 0, "No memories retrieved — query failed"
+    assert len(results) > 0, "No memories retrieved - query failed"
     top = results[0]
     print(f"  Top result: '{top['text']}'  (tier={top['tier']}, distance={top['distance']:.3f})")
 
     # ------------------------------------------------------------------ Agent
-    print("Step 5: Agent chat — ask where Maya lives")
+    print("Step 5: Agent chat - ask where Maya lives")
     from src.agent import MemAgeAgent
     agent = MemAgeAgent(store2, llm=call_llm, token_budget=300, k=5)
     resp = agent.chat("Where does Maya live?", session_id="smoke")

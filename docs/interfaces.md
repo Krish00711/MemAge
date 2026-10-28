@@ -95,13 +95,28 @@ Baselines in `src/eval/baselines.py` are callables of exactly this shape:
 
 The three checklist baselines (`memoryos`, `memory_r1`, `hmem`) are **project-level approximations, not paper reproductions** (see `src/eval/baselines.py` module docstring).
 
+Two case helpers in `src/eval/baselines.py` convert a `BenchmarkCase` to baseline input: `memory_entries_from_case(case) -> List[dict]` gives one entry per turn with the dataset turn ID preserved (`locomo` `dia_id`; `longmemeval` flattened per session as `session_id`) — this is what the entry-based baselines receive; `history_from_case(case) -> str` is the formatted full-history string (`format_full_history` over the same entries) — used only by the `full_history` baseline. Both live-dataset formats are supported (synthetic cases have neither `turns` nor `sessions` and yield empty history / entries).
+
+### The real `none` strategy (our system) on real datasets
+
+Built by `_build_strategy(baseline, token_budget, data_dir, embedder=None)` in `src/eval/run_benchmark.py` → `_build_none_strategy(...)`, per case:
+
+`case → memory_entries_from_case → _store_items_from_entries → fresh TieredMemoryStore → RetrievalContext(CoarseRetriever → LLMReranker(call_llm) → token budget → format_context) → make_retrieval_fn`
+
+- `_store_items_from_entries(entries)` produces one store item per **dataset memory id** (LoCoMo `dia_id` per turn; LongMemEval `session_id` with that session's turns joined — the store's primary key and the `relevant_ids` unit are the same, so Recall@K/P@K/MRR stay id-compatible). Text/timestamp/source follow `_normalize_entry` precedence; entries are never mutated; id-less/empty-text entries are skipped.
+- **`none` semantics: no selective-memory controller filtering.** Every case memory is stored as-is (no extraction LLM, no controller ADD/UPDATE/DELETE decisions); Stage-1 receives *all* of the case's memories (`k = item count`); answering is `call_llm` (provider-agnostic). It is never the synthetic demo's `_StaticStore`/`_LexicalReranker` — those exist only for `--dataset synthetic`.
+- **Case isolation:** each `memory_prepare(case)` replaces the strategy state wholesale with a new store; with chromadb installed the store persists to a unique temp dir per case (previous case's dir removed), without chromadb the store's per-instance in-memory fallback applies. Prepare failures reset state, print to stderr, and never serve the previous case.
+- `embedder=None` uses the store's default chain (`sentence-transformers` → `fastembed`); if neither exists (and nothing was injected) `_build_strategy` returns `None` → CLI exit 2 with the dependency named. Tests inject a deterministic embedder via the `embedder=` parameter.
+- The returned `retrieval_fn` and `memory_prepare` carry a diagnostic `.state` dict: `store` / `ctx` / `retrieval_fn` / `persist_dir` / `thresholds` / `error`.
+- `_build_none_strategy` doubles as the **real-dataset ablation builder** (one factor varied per config, all other behavior identical): `stage` (`"two_stage"` → `LLMReranker`, `"coarse_only"` → `PassthroughReranker`), `pipe_k` (Stage-1 candidate count; the metric cutoff stays on `BenchmarkRunner`), and `thresholds` (when not `None`, each memory is ingested through `src.controller.controller.process(candidate, store, llm=call_llm, thresholds=...)` instead of a blind `store.add` — **signal-ablation scope**: thresholds change what is stored and therefore retrieval/QA metrics; when `None` the controller is never invoked, preserving the `none` baseline). `build_real_ablation_spec(AblationConfig, ...)` maps `stage_configs` / `k_configs` / `budget_configs` / `signal_configs` params onto those arguments (`params["token_budget"]` overrides the builder default).
+
 ## src/eval/comparison.py  (multi-strategy runs)
 
 `compare_strategies(dataset, strategies, answer_fn, k=5) -> ComparisonResult`
 
 - `dataset`: `BenchmarkDataset` or sequence of `BenchmarkCase`.
 - `strategies`: `list[StrategySpec]` with unique non-empty `name`s; each gets its own `BenchmarkRunner` over a fresh copy of the cases (results isolated, input order preserved).
-- `StrategySpec(name, retrieval_fn, answer_fn=None)` — per-strategy `answer_fn` falls back to the shared one.
+- `StrategySpec(name, retrieval_fn, answer_fn=None, memory_prepare_fn=None)` — per-strategy `answer_fn` falls back to the shared one; `memory_prepare_fn` (if set) is called with the case before `retrieval_fn` and is forwarded to `BenchmarkRunner` (used by real-dataset strategies for per-case state, e.g. an isolated store). Both must be callable-or-`None` (`TypeError` otherwise).
 - `ComparisonResult(dataset_name, k, num_cases, results)` with `.names` / `.get(name)`; each `StrategyResult(name, report)` wraps the unmodified `BenchmarkReport`.
 - `format_comparison_table(result) -> str` renders the aligned text table (`None` metrics as `-`).
 
@@ -114,6 +129,11 @@ The three checklist baselines (`memoryos`, `memory_r1`, `hmem`) are **project-le
 - `k` (the metric cutoff) stays fixed across configs — an ablation varies exactly one factor.
 - `AblationResult(ablation, configs, comparison)` with `.labels` / `.get(label)`; the nested `ComparisonResult` holds one `BenchmarkReport` per config.
 - `PassthroughReranker` satisfies the `RetrievalContext` rerank contract by returning candidates unchanged (Stage-2 bypass for `coarse_only`).
+- The builder's returned `memory_prepare_fn` is preserved when `run_ablation` re-labels specs with config labels.
+
+### CLI dispatch (`src/eval/run_benchmark.py`)
+
+`--compare` / `--ablate` dispatch on `--dataset`: `synthetic` keeps the existing synthetic paths (`run_synthetic_comparison` / `run_synthetic_ablation`); `locomo` / `longmemeval` load via `_load_real_dataset(dataset, data_dir, sample)` and run `run_dataset_comparison` (→ `build_real_comparison_specs(names, token_budget, data_dir, embedder)`: one `StrategySpec` per name from `_build_strategy`, all with `answer_fn=None` so one shared `_build_answer_fn(call_llm)` is used — `compare_strategies` → `Comparison ({dataset}, k={k})` header + `format_comparison_table`) or `run_dataset_ablation` (→ `build_real_ablation_spec` per config; a probe of `configs[0]` reports a dependency error before the run). Missing dataset files/dependencies → exit 2 (`_get_unavailable_message`); usage errors (unknown/empty/duplicate names, `--compare`+`--ablate`) → exit 1. Real-dataset signal ablations apply thresholds at ingestion via the controller (scope above); synthetic signal ablations gate the demo memories through the real `src.controller.controller.decide` policy.
 
 ## src/eval/serialization.py  (result export)
 

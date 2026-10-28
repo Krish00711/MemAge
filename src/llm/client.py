@@ -15,6 +15,8 @@ Owner: Krish.  Interface contract: docs/interfaces.md
 from __future__ import annotations
 
 import os
+import re
+import time
 
 # ---------------------------------------------------------------------------
 # Default model names — override via env if needed
@@ -137,6 +139,29 @@ def _call_gemini(prompt: str, system: str | None, **kwargs) -> str:
 # Groq
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Transient rate-limit retry (Groq TPM is tight: 8000 tokens/min on the
+# free tier).  A rejected 429 consumes no quota, so a short bounded retry
+# turns a transient TPM blip into a success instead of a permanent
+# "[LLM error: ...]" answer.  Non-rate-limit errors are never retried.
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_RE = re.compile(r"try again in ([\d.]+)s", re.IGNORECASE)
+_MAX_RATE_RETRIES = 3
+
+
+def _rate_limit_delay(message: str, attempt: int) -> float | None:
+    """Seconds to wait for a transient rate-limit error, else ``None``."""
+    if "429" not in message and "rate_limit" not in message.lower():
+        return None
+    match = _RATE_LIMIT_RE.search(message)
+    if match:
+        # Honour the provider's own hint, with a small safety margin.
+        return min(float(match.group(1)) + 0.5, 30.0)
+    # No hint: exponential backoff (2s, 4s, 8s, ... capped at 30s).
+    return min(2.0 * (2 ** attempt), 30.0)
+
+
 def _call_groq(prompt: str, system: str | None, **kwargs) -> str:
     try:
         from groq import Groq  # type: ignore[import]
@@ -166,14 +191,22 @@ def _call_groq(prompt: str, system: str | None, **kwargs) -> str:
         create_kwargs["temperature"] = kwargs["temperature"]
 
     client = Groq(api_key=api_key)
-    try:
-        completion = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            **create_kwargs,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Groq API call failed: {exc}") from exc
+    completion = None
+    for attempt in range(1 + _MAX_RATE_RETRIES):
+        try:
+            completion = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                **create_kwargs,
+            )
+            break
+        except Exception as exc:
+            delay = _rate_limit_delay(str(exc), attempt)
+            if delay is None or attempt == _MAX_RATE_RETRIES:
+                raise RuntimeError(f"Groq API call failed: {exc}") from exc
+            time.sleep(delay)
+    if completion is None:  # pragma: no cover - loop always sets or raises
+        raise RuntimeError("Groq API call failed: no completion produced.")
 
     try:
         text = completion.choices[0].message.content

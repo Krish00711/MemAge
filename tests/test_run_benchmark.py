@@ -34,9 +34,10 @@ def test_cli_defaults():
     assert args.baseline == "none"
 
 
-def test_unavailable_dataset_behavior():
-    # locomo data not present locally -> unavailable
-    msg = _get_unavailable_message("locomo", "none")
+def test_unavailable_dataset_behavior(tmp_path):
+    # locomo data absent from an empty data dir -> unavailable (hermetic:
+    # the repo's data/ folder may contain the real datasets)
+    msg = _get_unavailable_message("locomo", "none", str(tmp_path))
     assert msg is not None
     assert "not available locally" in msg or "requires" in msg
 
@@ -58,10 +59,11 @@ def test_no_baselines_are_stubs_anymore():
     assert NOT_YET_IMPLEMENTED_BASELINES == set()
 
 
-def test_dataset_available_synthetic():
+def test_dataset_available_synthetic(tmp_path):
     assert _dataset_available("synthetic") is True
-    # locomo not present (data folder empty)
-    assert _dataset_available("locomo") is False
+    # locomo not present in an empty data dir (hermetic: the repo's data/
+    # folder may contain the real datasets)
+    assert _dataset_available("locomo", str(tmp_path)) is False
 
 
 def test_main_synthetic_success(capsys):
@@ -72,8 +74,9 @@ def test_main_synthetic_success(capsys):
     assert "Mean F1" in out
 
 
-def test_main_unavailable_dataset_returns_error(capsys):
-    code = main(["--dataset", "locomo", "--baseline", "none"])
+def test_main_unavailable_dataset_returns_error(capsys, tmp_path):
+    code = main(["--dataset", "locomo", "--baseline", "none",
+                 "--data-dir", str(tmp_path)])
     assert code == 2
     err = capsys.readouterr().err
     assert "not available locally" in err or "Error" in err
@@ -185,27 +188,41 @@ def _write_locomo(tmp_path, n_cases=1):
     (d / "locomo10.json").write_text(json.dumps(fixture), encoding="utf-8")
 
 
-def test_data_dir_option_respected(tmp_path, capsys):
-    # without files: unavailable at the default location
-    assert _dataset_available("locomo") is False
+def test_data_dir_option_respected(tmp_path, capsys, monkeypatch):
+    # without files: unavailable at an empty data dir (hermetic: the repo's
+    # data/ folder may contain the real datasets)
     assert _dataset_available("locomo", str(tmp_path)) is False
 
     _write_locomo(tmp_path, n_cases=3)
     assert _dataset_available("locomo", str(tmp_path)) is True
 
+    # The real `none` strategy executes on real data: inject a deterministic
+    # embedder + fake LLM so the test stays offline (the store, pipeline and
+    # call_llm wiring under test are the real implementations).
+    from tests.test_real_none_baseline import (
+        _FakeLLM,
+        _HashEmbedder,
+        _patch_llm,
+        _patch_store_embedder,
+    )
+
+    _patch_llm(monkeypatch, _FakeLLM(answer="Answer 1"))
+    _patch_store_embedder(monkeypatch, _HashEmbedder())
+
     code = main(
         ["--dataset", "locomo", "--baseline", "none", "--data-dir", str(tmp_path)]
     )
     captured = capsys.readouterr()
-    # dataset loaded and parsed through the CLI...
+    # dataset loaded and parsed through the CLI, then benchmarked end-to-end
     assert "Loaded locomo: 3 cases" in captured.out
-    # ...then blocked by the not-yet-available store/LLM strategy
-    assert code == 2
-    assert "src/store" in captured.err or "chromadb" in captured.err
+    assert code == 0
+    assert "Mean F1" in captured.out
+    assert "MRR" in captured.out  # retrieval metrics are non-degenerate
 
 
-def test_real_dataset_without_files_still_reports_missing(capsys):
-    code = main(["--dataset", "longmemeval", "--baseline", "none"])
+def test_real_dataset_without_files_still_reports_missing(capsys, tmp_path):
+    code = main(["--dataset", "longmemeval", "--baseline", "none",
+                 "--data-dir", str(tmp_path)])
     captured = capsys.readouterr()
     assert code == 2
     assert "not available locally" in captured.err

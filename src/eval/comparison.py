@@ -62,11 +62,17 @@ class StrategySpec:
         answer_fn: Optional per-strategy answer function; falls back to the
             comparison-level ``answer_fn`` when ``None`` (keeps comparisons
             fair by default: every strategy answers with the same function).
+        memory_prepare_fn: Optional per-case preparation callable
+            ``(BenchmarkCase) -> None``, forwarded to the strategy's
+            ``BenchmarkRunner`` (real-dataset strategies use it to give each
+            case an isolated store / per-case retrieval closure; synthetic
+            strategies leave it ``None``).
     """
 
     name: str
     retrieval_fn: RetrievalFn
     answer_fn: Optional[AnswerFn] = None
+    memory_prepare_fn: Optional[Callable[[BenchmarkCase], Any]] = None
 
 
 @dataclass
@@ -175,6 +181,10 @@ def compare_strategies(
             raise ValueError(f"strategy {spec.name!r} retrieval_fn must be callable")
         if spec.answer_fn is not None and not callable(spec.answer_fn):
             raise ValueError(f"strategy {spec.name!r} answer_fn must be callable or None")
+        if spec.memory_prepare_fn is not None and not callable(spec.memory_prepare_fn):
+            raise ValueError(
+                f"strategy {spec.name!r} memory_prepare_fn must be callable or None"
+            )
 
     if isinstance(dataset, BenchmarkDataset):
         cases: List[BenchmarkCase] = list(dataset.cases)
@@ -188,6 +198,7 @@ def compare_strategies(
         runner = BenchmarkRunner(
             retrieval_fn=spec.retrieval_fn,
             answer_fn=spec.answer_fn if spec.answer_fn is not None else answer_fn,
+            memory_prepare_fn=spec.memory_prepare_fn,
             k=k,
         )
         # Fresh list per strategy: strategies can never share/alias the case

@@ -3,7 +3,8 @@
 Usage:
     python -m src.eval.run_benchmark --dataset synthetic --token-budget 512
     python -m src.eval.run_benchmark --dataset locomo --baseline none --data-dir data
-    python -m src.eval.run_benchmark --dataset longmemeval --baseline none
+    python -m src.eval.run_benchmark --dataset locomo --compare none,full_history,memoryos,memory_r1,hmem --data-dir data
+    python -m src.eval.run_benchmark --dataset longmemeval --ablate stage --data-dir data
 
 Dataset resolution: ``<data-dir>/<dataset>/*.json`` (default ``data-dir`` is
 the repository ``data/`` folder — see ``data/README.md`` for the expected
@@ -11,8 +12,16 @@ file names). No network, no downloads, no ChromaDB access.
 
 Baselines: ``none`` (our system), ``full_history`` (upper bound),
 ``memoryos`` (tiered approximation), ``memory_r1`` (budgeted approximation),
-and ``hmem`` (hierarchical approximation — see src/eval/baselines.py) all run
-on synthetic data today. All checklist baselines are now implemented.
+and ``hmem`` (hierarchical approximation — see src/eval/baselines.py).  All
+five run on the synthetic demo; on real datasets (LoCoMo / LongMemEval)
+``_build_strategy`` builds every one of them — ``none`` via a per-case
+TieredMemoryStore and the real two-stage retrieval pipeline.
+
+``--compare`` and ``--ablate`` run on BOTH the synthetic demo and real
+datasets: they reuse the same ``StrategySpec``/``compare_strategies``/
+``run_ablation``/``BenchmarkRunner`` abstractions, feeding them real-dataset
+strategies built by the same H-4 builders (per-case isolated stores,
+dataset memory IDs preserved).
 """
 
 from __future__ import annotations
@@ -74,6 +83,16 @@ NOT_YET_IMPLEMENTED_BASELINES: set = set()
 # Default token budget forwarded to the retrieval pipeline (used when the
 # --token-budget flag is omitted).
 DEFAULT_TOKEN_BUDGET = 512
+
+# Default Stage-1 shortlist size for the real-dataset ``none`` pipeline:
+# the coarse retriever scores every memory of the case, but only the top
+# min(item count, DEFAULT_STAGE1_K) candidates are handed to the LLM
+# reranker.  Unbounded shortlists (one per item) produced rerank prompts
+# that exceeded provider request/TPM limits on the real datasets (Groq
+# 413) and silently degraded Stage-2 to the lexical fallback; 30 keeps the
+# bounded prompt (see reranker text caps) small enough that the model's
+# full ranking response also fits the provider's per-minute token budget.
+DEFAULT_STAGE1_K = 30
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Comma-separated baselines to compare on the same dataset, e.g. "
-            "'none,full_history,memoryos,memory_r1,hmem' (synthetic only). "
+            "'none,full_history,memoryos,memory_r1,hmem' (works on synthetic "
+            "and on real datasets; real datasets need --data-dir files). "
             "When omitted, the single --baseline behavior is unchanged."
         ),
     )
@@ -188,10 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Run one ablation family on the synthetic dataset: 'stage' "
+            "Run one ablation family on the selected dataset: 'stage' "
             "(coarse-only vs two-stage), 'k:<v,v,...>' (Stage-1 candidate "
-            "counts), or 'budget:<v,v,...>' (token budgets), e.g. "
-            "'--ablate k:1,3,5'. Mutually exclusive with --compare."
+            "counts), 'budget:<v,v,...>' (token budgets), or "
+            "'signal:<name>' (controller thresholds; choices: importance, "
+            "temporal, contradiction, storage), e.g. '--ablate k:1,3,5'. "
+            "Mutually exclusive with --compare."
         ),
     )
     parser.add_argument(
@@ -490,8 +512,8 @@ def _save_run(
     }
     results_path = out / "results.json"
     results_path.write_text(_json.dumps(agg, indent=2), encoding="utf-8")
-    print(f"Saved predictions → {pred_path}")
-    print(f"Saved results     → {results_path}")
+    print(f"Saved predictions -> {pred_path}")
+    print(f"Saved results     -> {results_path}")
 
 
 def _export_result(result, export_json: Optional[str], export_csv: Optional[str]) -> Optional[int]:
@@ -586,6 +608,69 @@ def run_synthetic_comparison(
 # ---------------------------------------------------------------------------
 
 
+def _deterministic_signal_llm(prompt: str, system: str | None = None, **kwargs) -> str:
+    """No-network scoring stand-in for the synthetic demo's controller.
+
+    Returns JSON the controller's LLM scorers parse
+    (``src/controller/scoring.py``):
+
+    * importance ``0.5`` — mid band: kept by the permissive configs
+      (``0.0``/``0.3``) and suppressed by the strict ``0.6`` config.
+    * contradiction ``0.55`` — between the loose/default update thresholds
+      (``0.3``/``0.5``) and the strict ``0.7`` one, so UPDATE vs ADD can
+      actually diverge.
+
+    Only the controller scoring path ever sees this callable: the synthetic
+    demo answers via ``_synthetic_answer`` and reranks via
+    ``_LexicalReranker`` (both offline by design).
+    """
+    if system and "contradiction detector" in system:
+        return '{"contradiction": 0.55}'
+    return '{"importance": 0.5}'
+
+
+def _gate_synthetic_memories(memories, thresholds) -> List[dict]:
+    """Apply the REAL controller decision policy to the demo memories.
+
+    Runs ``src.controller.controller.decide`` (real scoring signals + real
+    joint policy with *thresholds*) per memory and applies the resulting
+    ADD/UPDATE/DELETE/NOOP decision to a plain list — the synthetic demo
+    has no embedding store (no network / no dependencies allowed), so the
+    demo list stands in for the store.  Thresholds therefore genuinely
+    change which demo memories survive ingestion (the historical no-op
+    behavior — thresholds recorded but never applied — is gone).
+
+    Never mutates the input items (copies are stored), so repeated runs in
+    one process see the original ``_SYNTHETIC_MEMORIES``.
+    """
+    from src.controller.controller import decide as controller_decide
+
+    kept: List[dict] = []
+    for item in memories:
+        existing = kept[:5]  # stand-in for store.query(text, k=5, "all")
+        decision = controller_decide(
+            item,
+            existing,
+            llm=_deterministic_signal_llm,
+            thresholds=thresholds,
+            counts={"STM": len(kept), "MTM": 0, "LTM": 0},
+        )
+        action = decision.get("action")
+        target = decision.get("target_id")
+        if action == "ADD":
+            kept.append(dict(item))
+        elif action == "UPDATE" and target:
+            for slot in kept:
+                if slot.get("id") == target:
+                    slot["text"] = item.get("text", "")
+                    break
+        elif action == "DELETE" and target:
+            kept = [s for s in kept if s.get("id") != target]
+            kept.append(dict(item))
+        # NOOP: the policy decided not to store this memory.
+    return kept
+
+
 def build_synthetic_ablation_spec(
     cfg: AblationConfig, token_budget: int = DEFAULT_TOKEN_BUDGET
 ) -> StrategySpec:
@@ -597,6 +682,10 @@ def build_synthetic_ablation_spec(
         * ``k``: Stage-1 candidate count (default: all synthetic memories).
         * ``token_budget``: budget forwarded to ``make_retrieval_fn``
           (default: the CLI/config budget).
+        * ``thresholds`` (signal families): controller-gate the demo
+          memories through the REAL ``decide`` policy before the pipeline
+          sees them (see :func:`_gate_synthetic_memories`) — this is what
+          makes ``--ablate signal:...`` functional instead of a no-op.
 
     Raises:
         ValueError: Unknown ``stage`` value.
@@ -609,9 +698,13 @@ def build_synthetic_ablation_spec(
         )
     pipe_k = params.get("k", len(_SYNTHETIC_MEMORIES))
     budget = params.get("token_budget", token_budget)
+    thresholds = params.get("thresholds")
+    memories = _SYNTHETIC_MEMORIES
+    if thresholds is not None:
+        memories = _gate_synthetic_memories(_SYNTHETIC_MEMORIES, thresholds)
     reranker = _LexicalReranker() if stage == "two_stage" else PassthroughReranker()
     ctx = RetrievalContext(
-        CoarseRetriever(_StaticStore(_SYNTHETIC_MEMORIES)),
+        CoarseRetriever(_StaticStore(memories)),
         reranker,
         k=pipe_k,
         tier="all",
@@ -664,36 +757,286 @@ def run_synthetic_ablation(
 # ---------------------------------------------------------------------------
 
 
-def _build_strategy(baseline: str, token_budget: int, data_dir: Optional[str]):
-    """Build ``(retrieval_fn, answer_fn)`` for a real dataset.
+def _embedder_available() -> bool:
+    """True when the store's default embedder chain can resolve.
 
-    The four history-based baselines (full_history, memoryos, memory_r1, hmem)
-    use ``history_from_case`` to derive per-case context from adapter metadata
-    and ``call_llm`` for answer generation.  The ``none`` (our system) baseline
-    requires a live store and is not implemented here.
-
-    Returns ``(retrieval_fn, answer_fn)`` or ``None`` if unavailable.
+    Mirrors the fallback order in ``TieredMemoryStore.__init__``
+    (src/store/memory_store.py): ``sentence-transformers`` first, then
+    ``fastembed`` via ``FastEmbedAdapter``.  An injected embedder bypasses
+    this check (the caller only invokes this when no embedder was given).
     """
-    # Our system baseline requires a real store — not wired yet.
-    if baseline == "none":
-        return None
-
-    # All history-based baselines need call_llm for answer generation.
     try:
-        from src.llm.client import call_llm
+        import sentence_transformers  # noqa: F401
+        return True
     except ImportError:
+        pass
+    try:
+        import fastembed  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _store_items_from_entries(entries) -> List[dict]:
+    """Turn case history entries into store-ready ``CandidateMemoryItem`` dicts.
+
+    One item per *dataset memory id* — the unit ``case.relevant_ids`` refers
+    to, so retrieved ids stay Recall@K / P@K / MRR compatible:
+
+    * LoCoMo: ``dia_id`` per turn (unique) -> one item per turn.
+    * LongMemEval: ``session_id``; all turns of one session are joined into
+      a single item (the store's primary key would otherwise collide, and
+      the relevance unit *is* the session).
+
+    Text/timestamp/source use the same precedence as the baselines'
+    ``_normalize_entry`` (``text`` else ``content``; ``source`` else ``id``)
+    so ``none`` sees the same memory content as the other strategies for the
+    same history.  Original entry dicts are never mutated; entries without an
+    id or without any usable text are skipped.
+
+    Returns ``[]`` for empty/unusable input.
+    """
+    items: List[dict] = []
+    index: dict = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        eid = str(entry.get("id") or "").strip()
+        if not eid:
+            continue
+        text = entry.get("text")
+        if text is None or text == "":
+            text = entry.get("content", "")
+        text = str(text).strip()
+        timestamp = str(entry.get("timestamp") or entry.get("date") or "")
+        source = str(entry.get("source") or eid)
+        pos = index.get(eid)
+        if pos is None:
+            index[eid] = len(items)
+            items.append({
+                "id": eid,
+                "text": text,
+                "timestamp": timestamp,
+                "source": source,
+                "embedding": None,  # filled in by the store
+            })
+        elif text:
+            prev = items[pos]
+            prev["text"] = (
+                f"{prev['text']}\n{text}" if prev["text"] else text
+            )
+    return [item for item in items if item["text"]]
+
+
+def _build_none_strategy(token_budget: int, call_llm, embedder, answer_fn,
+                         stage: str = "two_stage",
+                         pipe_k: Optional[int] = None,
+                         thresholds: Optional[dict] = None):
+    """Build the real-data ``none`` pipeline — our system.
+
+    Per-case execution flow (every case gets an ISOLATED memory state):
+
+        case -> memory_entries_from_case -> _store_items_from_entries
+            -> fresh TieredMemoryStore (dataset memory ids preserved)
+            -> RetrievalContext(CoarseRetriever -> reranker
+               -> token-budget selection -> format_context)
+            -> make_retrieval_fn(ctx, token_budget)
+
+    Semantics of ``none``: **no selective-memory controller filtering** —
+    every memory of the case is added to the store as-is (no extraction LLM,
+    no controller ADD/UPDATE/DELETE decisions), and answering is plain
+    two-stage retrieval + ``call_llm`` (provider-agnostic, never hard-codes
+    a provider).  Stage-1 coarse-scores every memory of the case and
+    shortlists the top ``min(item count, DEFAULT_STAGE1_K)`` for the LLM
+    reranker (an unbounded shortlist overflows provider prompt limits on
+    the real datasets).
+
+    This builder doubles as the real-dataset **ablation** strategy builder
+    (same components, one factor varied per config):
+
+        stage      ``"two_stage"`` (default) uses ``LLMReranker(call_llm)``;
+                   ``"coarse_only"`` bypasses Stage-2 with the existing
+                   ``PassthroughReranker`` (candidates pass through in
+                   Stage-1 order).
+        pipe_k     Stage-1 candidate count for the retrieval context
+                   (``None`` = ``min(item count, DEFAULT_STAGE1_K)``).  The
+                   metric cutoff ``k`` used by ``BenchmarkRunner`` is NOT
+                   touched here — it is fixed by the caller for fair
+                   ablations.
+        thresholds When not ``None`` (**signal ablation scope**), each case
+                   memory is ingested through the real selective-memory
+                   controller — ``src.controller.controller.process(candidate,
+                   store, llm=call_llm, thresholds=...)`` — instead of a
+                   blind ``store.add``.  Thresholds therefore genuinely
+                   change what is stored (ADD/UPDATE/DELETE/NOOP) and, in
+                   turn, retrieval/QA metrics.  When ``None`` (the ``none``
+                   baseline and stage/k/budget ablations) the controller is
+                   NOT invoked at all — the H-4 baseline semantics are
+                   unchanged.
+
+    Isolation: the state dict is replaced wholesale by each
+    ``memory_prepare``; with chromadb installed the store persists into a
+    unique temp directory per case (the previous case's directory is
+    removed), and without chromadb the store already uses per-instance
+    in-memory collections.
+
+    Returns ``(retrieval_fn, answer_fn, memory_prepare)`` — both callables
+    carry a diagnostic ``.state`` dict (``store`` / ``ctx`` /
+    ``retrieval_fn`` / ``persist_dir`` / ``thresholds`` / ``error``) — or
+    ``None`` when the default embedder chain is unavailable and none was
+    injected (reported on stderr rather than silently degrading).
+    """
+    import shutil
+    import tempfile
+
+    from src.eval.baselines import memory_entries_from_case
+    from src.eval.benchmark import RetrievalOutcome, make_retrieval_fn
+    from src.retrieval.reranker import LLMReranker
+
+    if stage not in ("two_stage", "coarse_only"):
+        raise ValueError(
+            f"unknown stage {stage!r} (expected coarse_only | two_stage)"
+        )
+    if thresholds is not None and not isinstance(thresholds, dict):
+        raise ValueError(f"thresholds must be a dict or None, got {type(thresholds)!r}")
+
+    controller_process = None
+    if thresholds is not None:
+        # Signal ablation only: real controller ingestion (scoring + policy).
+        from src.controller.controller import process as controller_process
+
+    if embedder is None and not _embedder_available():
+        print(
+            "Error: baseline 'none' needs a memory-store embedder but neither "
+            "sentence-transformers nor fastembed is installed (see "
+            "src/store/memory_store.py), and none was injected.",
+            file=sys.stderr,
+        )
         return None
 
-    from src.eval.baselines import (
-        history_from_case,
-        full_history_retrieval_fn,
-        memoryos_retrieval_fn,
-        memory_r1_retrieval_fn,
-        hmem_retrieval_fn,
-    )
-    from src.eval.dataset import BenchmarkCase
-    from src.eval.benchmark import RetrievalOutcome
+    # With chromadb the store persists to disk (unique dir per case keeps
+    # cases disjoint); without it TieredMemoryStore uses its own per-instance
+    # in-memory collections and persist_dir is irrelevant.
+    try:
+        import chromadb  # noqa: F401
+        chroma_available = True
+    except ImportError:
+        chroma_available = False
 
+    # One shared state, replaced wholesale by every memory_prepare call, so
+    # memories can never leak from one benchmark case into the next.
+    state: dict = {
+        "retrieval_fn": None,
+        "store": None,
+        "ctx": None,
+        "persist_dir": None,
+        "thresholds": thresholds,
+        "error": None,
+    }
+
+    def memory_prepare(case: BenchmarkCase) -> None:
+        """Give *case* its own store: fresh TieredMemoryStore + pipeline."""
+        from src.store.memory_store import TieredMemoryStore
+
+        prev_dir = state.get("persist_dir")
+        # Clear first: a failed prepare must never serve the previous case.
+        state.update(retrieval_fn=None, store=None, ctx=None, error=None)
+        if prev_dir:
+            shutil.rmtree(prev_dir, ignore_errors=True)
+            state["persist_dir"] = None
+        try:
+            items = _store_items_from_entries(memory_entries_from_case(case))
+            kwargs = {"embedder": embedder}
+            if chroma_available:
+                persist_dir = tempfile.mkdtemp(prefix="memage_none_")
+                state["persist_dir"] = persist_dir
+                kwargs["persist_dir"] = persist_dir
+            store = TieredMemoryStore(**kwargs)
+            if controller_process is None:
+                # none baseline / stage+k+budget ablations: store as-is.
+                for item in items:
+                    store.add(item)  # store fills the embedding, rebalances tiers
+            else:
+                # Signal ablation: controller decides per memory; the applied
+                # thresholds decide what is stored (genuinely functional).
+                for item in items:
+                    controller_process(
+                        item, store, llm=call_llm, thresholds=thresholds
+                    )
+            reranker = (
+                LLMReranker(call_llm) if stage == "two_stage"
+                else PassthroughReranker()
+            )
+            ctx = RetrievalContext(
+                retriever=CoarseRetriever(store),
+                reranker=reranker,
+                k=(
+                    pipe_k
+                    if pipe_k is not None
+                    else min(max(len(items), 1), DEFAULT_STAGE1_K)
+                ),
+                tier="all",
+            )
+        except Exception as exc:
+            state["error"] = str(exc)
+            print(
+                f"Error: could not prepare memories for case "
+                f"{getattr(case, 'case_id', '?')}: {exc}",
+                file=sys.stderr,
+            )
+            return
+        state["store"] = store
+        state["ctx"] = ctx
+        state["retrieval_fn"] = make_retrieval_fn(ctx, token_budget)
+
+    def retrieval_fn(query: str) -> RetrievalOutcome:
+        fn = state.get("retrieval_fn")
+        if fn is None:
+            return RetrievalOutcome(context="", retrieved_ids=None, tokens=0)
+        return fn(query)
+
+    retrieval_fn.state = state
+    memory_prepare.state = state
+    return retrieval_fn, answer_fn, memory_prepare
+
+
+# Provider request-size guard for answer prompts (same class of fix as
+# ``_PROMPT_TEXT_MAX_*`` in src/retrieval/reranker.py): Groq rejects any
+# request that would push the rolling tokens-per-minute window past its
+# limit (observed 413 "Limit 8000" = sibling calls in the same minute +
+# this request), and ``full_history`` contexts on the real datasets are
+# far larger (LoCoMo ~15k, LongMemEval ~84k whitespace tokens).  Caps are
+# sized from an observed 3.3 chars/token for the real LoCoMo history:
+# 16000 chars ≈ 4800 tokens + system/question ≈ 4900, leaving ~3000 TPM
+# window headroom for sibling strategy calls (rerank/answer) in the same
+# minute.  Budgeted strategies (budget <= ~4096 whitespace tokens) stay
+# under the char cap in practice, so their behavior is unchanged.
+_ANSWER_CONTEXT_MAX_WORDS = 3000
+_ANSWER_CONTEXT_MAX_CHARS = 16000
+
+
+def _truncate_answer_context(context: str) -> str:
+    """Head-truncate *context* to the answer prompt size caps (chronological
+    start kept, matching ``_truncate_for_prompt`` in the reranker)."""
+    if not context:
+        return context
+    words = context.split()
+    if len(words) > _ANSWER_CONTEXT_MAX_WORDS:
+        context = " ".join(words[:_ANSWER_CONTEXT_MAX_WORDS])
+    if len(context) > _ANSWER_CONTEXT_MAX_CHARS:
+        context = context[:_ANSWER_CONTEXT_MAX_CHARS]
+    return context
+
+
+def _build_answer_fn(call_llm):
+    """Shared real-dataset answer function for every strategy/config.
+
+    One ``(query, context) -> answer`` for the whole comparison/ablation so
+    all strategies answer identically (fairness: only retrieval differs).
+    Provider-agnostic — uses the injected/callable ``call_llm`` only.
+    Contexts above the provider request-size caps are head-truncated
+    (``_truncate_answer_context``); budgeted strategies never reach the cap.
+    """
     _ANSWER_SYSTEM = (
         "You are a helpful assistant with access to conversation history. "
         "Answer concisely using only the provided context. "
@@ -701,6 +1044,7 @@ def _build_strategy(baseline: str, token_budget: int, data_dir: Optional[str]):
     )
 
     def _answer_fn(query: str, context: str) -> str:
+        context = _truncate_answer_context(context)
         if context.strip():
             prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
         else:
@@ -710,17 +1054,76 @@ def _build_strategy(baseline: str, token_budget: int, data_dir: Optional[str]):
         except Exception as exc:
             return f"[LLM error: {exc}]"
 
+    return _answer_fn
+
+
+def _build_strategy(baseline: str, token_budget: int, data_dir: Optional[str],
+                    embedder=None):
+    """Build ``(retrieval_fn, answer_fn, memory_prepare)`` for a real dataset.
+
+    ``none`` (our system) uses the REAL MemAge components per case: an
+    isolated ``TieredMemoryStore`` holding the case's own memory entries
+    (dataset ids preserved), searched by the actual two-stage pipeline
+    (``CoarseRetriever`` -> ``LLMReranker`` -> token budget ->
+    ``format_context``) and answered via ``call_llm`` — see
+    :func:`_build_none_strategy`.  The ``full_history`` baseline uses
+    ``history_from_case`` (formatted context string); the entry-based
+    baselines (memoryos / memory_r1 / hmem) use
+    ``memory_entries_from_case`` (individual entries with preserved dataset
+    IDs).  All strategies answer with ``call_llm`` (provider-agnostic).
+
+    Args:
+        token_budget: Token budget for retrieval (forwarded to the pipeline
+            / entry baselines).
+        data_dir: Unused here (dataset files are loaded by the caller);
+            kept for signature compatibility.
+        embedder: Optional store embedder for ``none`` (tests inject a
+            deterministic one).  ``None`` -> the store's default chain
+            (sentence-transformers -> fastembed).
+
+    Returns ``(retrieval_fn, answer_fn, memory_prepare)`` or ``None`` if a
+    runtime dependency is unavailable (``src.llm`` import; or, for ``none``,
+    a default store embedder when *embedder* is ``None``).
+    """
+    # All strategies answer via call_llm; `none` also reranks with it.
+    try:
+        from src.llm.client import call_llm
+    except ImportError:
+        return None
+
+    from src.eval.baselines import (
+        history_from_case,
+        memory_entries_from_case,
+        full_history_retrieval_fn,
+        memoryos_retrieval_fn,
+        memory_r1_retrieval_fn,
+        hmem_retrieval_fn,
+    )
+    from src.eval.dataset import BenchmarkCase
+    from src.eval.benchmark import RetrievalOutcome
+
+    _answer_fn = _build_answer_fn(call_llm)
+
+    # Our system baseline: real per-case store + real two-stage pipeline.
+    if baseline == "none":
+        return _build_none_strategy(token_budget, call_llm, embedder, _answer_fn)
+
     # Per-case retrieval: build baseline from this case's history each time.
     def _make_retrieval_fn(case: BenchmarkCase, bsl: str, budget: int):
-        history = history_from_case(case)
         if bsl == "full_history":
-            return full_history_retrieval_fn(history)
+            # Full-history baseline formats the whole history itself.
+            return full_history_retrieval_fn(history_from_case(case))
+        # Entry-based baselines (memoryos / memory_r1 / hmem) expect a list
+        # of individual memory entries, not one preformatted history string:
+        # a single giant string would collapse into one id-less "memory",
+        # losing dataset turn IDs and making retrieval metrics degenerate.
+        entries = memory_entries_from_case(case)
         if bsl == "memoryos":
-            return memoryos_retrieval_fn(history)
+            return memoryos_retrieval_fn(entries)
         if bsl == "memory_r1":
-            return memory_r1_retrieval_fn(history, token_budget=budget)
+            return memory_r1_retrieval_fn(entries, token_budget=budget)
         if bsl == "hmem":
-            return hmem_retrieval_fn(history, token_budget=budget)
+            return hmem_retrieval_fn(entries, token_budget=budget)
         raise ValueError(f"Unknown baseline: {bsl}")
 
     # Closure captures the per-case retrieval function.
@@ -740,6 +1143,40 @@ def _build_strategy(baseline: str, token_budget: int, data_dir: Optional[str]):
     return retrieval_fn, _answer_fn, memory_prepare
 
 
+def _load_real_dataset(
+    dataset: str, data_dir: Optional[str], sample: Optional[int]
+):
+    """Load and sample-slice a real dataset, printing the standard banner.
+
+    Returns ``(loaded, total, exit_code)``.  On failure ``loaded`` is
+    ``None`` and *exit_code* is 2 (dataset files unavailable) or 1 (parse
+    error); the actionable error has already been printed to stderr.
+    """
+    try:
+        loaded = load_dataset(dataset, data_dir=data_dir)
+    except DatasetFileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return None, 0, 2
+    except DatasetFormatError as exc:
+        print(f"Error: dataset '{dataset}' could not be parsed: {exc}", file=sys.stderr)
+        return None, 0, 1
+
+    path = resolve_dataset_file(dataset, data_dir)
+    total = len(loaded)
+    if sample is not None:
+        from src.eval.dataset import BenchmarkDataset as _BD
+        loaded = _BD(cases=list(loaded.cases)[:sample], name=loaded.name)
+    print(f"Loaded {dataset}: {total} cases from {path}"
+          + (f" (using first {len(loaded)})" if sample else ""))
+    return loaded, total, 0
+
+
+_DEP_ERROR_HINT = (
+    "a runtime dependency is unavailable (src/llm client; for the 'none' "
+    "pipeline also a src/store embedder: sentence-transformers or fastembed)"
+)
+
+
 def run_dataset_benchmark(
     dataset: str,
     baseline: str,
@@ -751,28 +1188,15 @@ def run_dataset_benchmark(
     output_dir: Optional[str] = None,
 ) -> int:
     """Load a real dataset, report it, and benchmark if a strategy exists."""
-    try:
-        loaded = load_dataset(dataset, data_dir=data_dir)
-    except DatasetFileNotFoundError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 2
-    except DatasetFormatError as exc:
-        print(f"Error: dataset '{dataset}' could not be parsed: {exc}", file=sys.stderr)
-        return 1
-
-    path = resolve_dataset_file(dataset, data_dir)
-    total = len(loaded)
-    if sample is not None:
-        from src.eval.dataset import BenchmarkDataset as _BD
-        loaded = _BD(cases=list(loaded.cases)[:sample], name=loaded.name)
-    print(f"Loaded {dataset}: {total} cases from {path}"
-          + (f" (using first {len(loaded)})" if sample else ""))
+    loaded, total, code = _load_real_dataset(dataset, data_dir, sample)
+    if loaded is None:
+        return code
 
     strategy = _build_strategy(baseline, token_budget, data_dir)
     if strategy is None:
         print(
-            f"Error: cannot execute baseline '{baseline}' on real data yet — "
-            f"requires src/store (TieredMemoryStore + chromadb). "
+            f"Error: cannot execute baseline '{baseline}' on real data - "
+            f"{_DEP_ERROR_HINT}. "
             f"Dataset parsing succeeded ({total} cases).",
             file=sys.stderr,
         )
@@ -789,6 +1213,246 @@ def run_dataset_benchmark(
     _print_report(report, k, f"Benchmark ({dataset}, baseline={baseline})")
     _save_run(report, output_dir=output_dir, dataset=dataset, baseline=baseline,
               token_budget=token_budget, k=k, sample=sample, seed=seed)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Real-dataset comparison & ablation (same abstractions as the synthetic path)
+# ---------------------------------------------------------------------------
+
+
+def build_real_comparison_specs(
+    names: List[str],
+    token_budget: int,
+    data_dir: Optional[str] = None,
+    embedder=None,
+):
+    """Build one isolated ``StrategySpec`` per baseline for a real dataset.
+
+    Reuses :func:`_build_strategy` (the H-4 builders) once per name — no
+    strategy shares state with another.  Each spec carries its own
+    ``memory_prepare_fn``, so every case of every strategy gets a fresh
+    preparation (case isolation).  All specs leave ``answer_fn`` unset so
+    the comparison uses ONE shared answer function (fairness: only
+    retrieval differs between strategies).
+
+    Returns ``(specs, answer_fn)`` or ``(None, None)`` when a runtime
+    dependency is missing (an actionable message is printed by the caller).
+    """
+    try:
+        from src.llm.client import call_llm
+    except ImportError:
+        return None, None
+
+    answer_fn = _build_answer_fn(call_llm)
+    specs: List[StrategySpec] = []
+    for name in names:
+        strategy = _build_strategy(name, token_budget, data_dir, embedder=embedder)
+        if strategy is None:
+            return None, None
+        retrieval_fn, _strategy_answer_fn, memory_prepare_fn = strategy
+        specs.append(
+            StrategySpec(
+                name=name,
+                retrieval_fn=retrieval_fn,
+                answer_fn=None,          # shared answer_fn keeps the run fair
+                memory_prepare_fn=memory_prepare_fn,
+            )
+        )
+    return specs, answer_fn
+
+
+def run_dataset_comparison(
+    dataset: str,
+    names: List[str],
+    k: int,
+    token_budget: int,
+    data_dir: Optional[str] = None,
+    sample: Optional[int] = None,
+    export_json: Optional[str] = None,
+    export_csv: Optional[str] = None,
+    embedder=None,
+) -> int:
+    """Run ``--compare`` on a real dataset (LoCoMo / LongMemEval).
+
+    Flow: load via the existing adapters → build one isolated strategy per
+    name (reusing the H-4 builders; ``none`` included verbatim) →
+    ``compare_strategies`` (existing ``BenchmarkRunner`` + metrics per
+    strategy) → deterministic ``format_comparison_table`` → optional
+    JSON/CSV export.
+
+    Returns exit code 0 (2 dataset/dependency/validation, 1 parse error).
+    """
+    loaded, total, code = _load_real_dataset(dataset, data_dir, sample)
+    if loaded is None:
+        return code
+
+    specs, answer_fn = build_real_comparison_specs(
+        names, token_budget, data_dir=data_dir, embedder=embedder
+    )
+    if specs is None:
+        print(
+            f"Error: cannot execute --compare ({','.join(names)}) on real "
+            f"data - {_DEP_ERROR_HINT}. "
+            f"Dataset parsing succeeded ({total} cases).",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        result = compare_strategies(loaded, specs, answer_fn, k=k)
+    except (ValueError, TypeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"Comparison ({result.dataset_name}, k={result.k}): "
+        f"{result.num_cases} cases, {len(result.results)} strategies"
+    )
+    print(format_comparison_table(result))
+    export_code = _export_result(result, export_json, export_csv)
+    if export_code is not None:
+        return export_code
+    return 0
+
+
+def build_real_ablation_spec(
+    cfg: AblationConfig,
+    token_budget: int = DEFAULT_TOKEN_BUDGET,
+    data_dir: Optional[str] = None,
+    embedder=None,
+) -> Optional[StrategySpec]:
+    """Map one ablation config onto the real two-stage pipeline strategy.
+
+    All four real ablation families reuse :func:`_build_none_strategy`
+    (the very builder behind the ``none`` baseline) with exactly one factor
+    varied per config — no parallel strategy stack:
+
+        * ``stage`` (params ``stage``): ``"coarse_only"`` swaps Stage-2 for
+          the existing ``PassthroughReranker``; ``"two_stage"`` keeps the
+          real ``LLMReranker``.
+        * ``k`` (params ``k``): Stage-1 candidate count (``pipe_k``).  The
+          metric cutoff ``k`` lives on ``BenchmarkRunner`` and is untouched.
+        * ``token_budget`` (params ``token_budget``): budget forwarded to
+          ``make_retrieval_fn`` per config.
+        * signal families (params ``thresholds``): controller-gated
+          ingestion (see ``_build_none_strategy``) — the selective-memory
+          controller decides what is stored; retrieval/answering are the
+          same pipeline as ``none``.
+
+    Returns ``None`` when a runtime dependency is unavailable (the caller
+    reports it).  Spec ``name`` is the config label (``run_ablation``
+    re-applies it anyway); ``answer_fn`` stays unset so all configs share
+    the one comparison-level answer function.
+    """
+    params = cfg.params
+    stage = params.get("stage", "two_stage")
+    pipe_k = params.get("k")
+    thresholds = params.get("thresholds")
+    budget = params.get("token_budget", token_budget)
+
+    try:
+        from src.llm.client import call_llm
+    except ImportError:
+        return None
+
+    built = _build_none_strategy(
+        budget,
+        call_llm,
+        embedder,
+        _build_answer_fn(call_llm),
+        stage=stage,
+        pipe_k=pipe_k,
+        thresholds=thresholds,
+    )
+    if built is None:
+        return None
+    retrieval_fn, _answer_fn, memory_prepare_fn = built
+    return StrategySpec(
+        name=cfg.label,
+        retrieval_fn=retrieval_fn,
+        answer_fn=None,
+        memory_prepare_fn=memory_prepare_fn,
+    )
+
+
+def run_dataset_ablation(
+    dataset: str,
+    configs: List[AblationConfig],
+    ablation: str,
+    k: int,
+    token_budget: int,
+    data_dir: Optional[str] = None,
+    sample: Optional[int] = None,
+    export_json: Optional[str] = None,
+    export_csv: Optional[str] = None,
+    embedder=None,
+) -> int:
+    """Run ``--ablate`` (stage / k / budget / signal) on a real dataset.
+
+    Flow: load via the existing adapters → build one isolated strategy per
+    config (all configs share the same builder, one factor differs) →
+    ``run_ablation`` (delegates to ``compare_strategies`` → existing
+    ``BenchmarkRunner`` + metrics, metric cutoff ``k`` fixed across
+    configs) → deterministic table → optional JSON/CSV export.
+
+    Returns exit code 0 (2 dataset/dependency/validation, 1 parse error).
+    """
+    loaded, total, code = _load_real_dataset(dataset, data_dir, sample)
+    if loaded is None:
+        return code
+
+    try:
+        from src.llm.client import call_llm
+    except ImportError:
+        call_llm = None
+    if call_llm is None:
+        print(
+            f"Error: cannot execute --ablate {ablation} on real "
+            f"data - {_DEP_ERROR_HINT}. "
+            f"Dataset parsing succeeded ({total} cases).",
+            file=sys.stderr,
+        )
+        return 2
+    answer_fn = _build_answer_fn(call_llm)
+
+    # Probe the first config for an actionable dependency error BEFORE the
+    # run (e.g. no store embedder for the none pipeline).
+    probe = build_real_ablation_spec(
+        configs[0], token_budget=token_budget, data_dir=data_dir, embedder=embedder
+    )
+    if probe is None:
+        print(
+            f"Error: cannot execute --ablate {ablation} on real data - "
+            f"{_DEP_ERROR_HINT}. "
+            f"Dataset parsing succeeded ({total} cases).",
+            file=sys.stderr,
+        )
+        return 2
+
+    def builder(cfg: AblationConfig) -> StrategySpec:
+        spec = build_real_ablation_spec(
+            cfg, token_budget=token_budget, data_dir=data_dir, embedder=embedder
+        )
+        if spec is None:  # cannot happen: probe succeeded with same deps
+            raise ValueError(f"could not build strategy for config {cfg.label!r}")
+        return spec
+
+    try:
+        result = run_ablation(
+            loaded, configs, builder, answer_fn, k=k, ablation=ablation
+        )
+    except (ValueError, TypeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    comp = result.comparison
+    print(
+        f"Ablation {result.ablation} ({comp.dataset_name}, metric_k={comp.k}): "
+        f"{comp.num_cases} cases, {len(result.configs)} configurations"
+    )
+    print(format_comparison_table(comp))
+    export_code = _export_result(result, export_json, export_csv)
+    if export_code is not None:
+        return export_code
     return 0
 
 
@@ -820,8 +1484,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 1
 
-    # Comparison mode (orthogonal to --baseline; validated here, runs on
-    # synthetic only until real-dataset strategies exist).
+    # Comparison mode (orthogonal to --baseline; validated here, then run on
+    # the selected dataset — synthetic demo or a real dataset's cases).
     if args.compare is not None:
         names = [n.strip() for n in args.compare.split(",") if n.strip()]
         unknown = [n for n in names if n not in SUPPORTED_BASELINES]
@@ -842,22 +1506,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         if len(set(names)) != len(names):
             print("Error: duplicate baseline names in --compare", file=sys.stderr)
             return 1
-        if args.dataset != "synthetic":
-            print(
-                "Error: --compare currently requires --dataset synthetic "
-                "(strategy construction for real datasets awaits src/llm).",
-                file=sys.stderr,
+        if args.dataset == "synthetic":
+            return run_synthetic_comparison(
+                names,
+                k=args.k,
+                token_budget=args.token_budget,
+                export_json=args.export_json,
+                export_csv=args.export_csv,
             )
-            return 2
-        return run_synthetic_comparison(
-            names,
+        # Real dataset: same name validation as the single-baseline path.
+        msg = _get_unavailable_message(args.dataset, "none", args.data_dir)
+        if msg is not None:
+            print(f"Error: {msg}", file=sys.stderr)
+            if "not yet implemented" in msg or "not available locally" in msg:
+                return 2
+            return 1
+        return run_dataset_comparison(
+            dataset=args.dataset,
+            names=names,
             k=args.k,
             token_budget=args.token_budget,
+            data_dir=args.data_dir,
+            sample=args.sample,
             export_json=args.export_json,
             export_csv=args.export_csv,
         )
 
-    # Ablation mode (also synthetic-only; mutually exclusive with --compare).
+    # Ablation mode (mutually exclusive with --compare; runs on the selected
+    # dataset — synthetic demo or a real dataset's cases).
     if args.ablate is not None:
         kind, _, raw = args.ablate.partition(":")
         kind, raw = kind.strip(), raw.strip()
@@ -918,18 +1594,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        if args.dataset != "synthetic":
-            print(
-                "Error: --ablate currently requires --dataset synthetic "
-                "(strategy construction for real datasets awaits src/llm).",
-                file=sys.stderr,
+        if args.dataset == "synthetic":
+            return run_synthetic_ablation(
+                configs,
+                ablation=ablation,
+                k=args.k,
+                token_budget=args.token_budget,
+                export_json=args.export_json,
+                export_csv=args.export_csv,
             )
-            return 2
-        return run_synthetic_ablation(
-            configs,
+        # Real dataset: same availability contract as the single-baseline path.
+        msg = _get_unavailable_message(args.dataset, "none", args.data_dir)
+        if msg is not None:
+            print(f"Error: {msg}", file=sys.stderr)
+            if "not yet implemented" in msg or "not available locally" in msg:
+                return 2
+            return 1
+        return run_dataset_ablation(
+            dataset=args.dataset,
+            configs=configs,
             ablation=ablation,
             k=args.k,
             token_budget=args.token_budget,
+            data_dir=args.data_dir,
+            sample=args.sample,
             export_json=args.export_json,
             export_csv=args.export_csv,
         )

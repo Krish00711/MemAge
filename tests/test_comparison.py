@@ -359,7 +359,7 @@ def test_cli_compare_all_strategies(capsys):
         assert any(l.startswith(name) for l in out.splitlines()), name
 
 
-def test_cli_compare_errors(capsys):
+def test_cli_compare_errors(capsys, tmp_path):
     # unknown name
     assert main(["--dataset", "synthetic", "--compare", "none,bogus"]) == 1
     assert "unknown baseline" in capsys.readouterr().err
@@ -369,9 +369,13 @@ def test_cli_compare_errors(capsys):
     # duplicates
     assert main(["--dataset", "synthetic", "--compare", "none,none"]) == 1
     assert "duplicate" in capsys.readouterr().err
-    # non-synthetic dataset
-    assert main(["--dataset", "locomo", "--compare", "none"]) == 2
-    assert "requires --dataset synthetic" in capsys.readouterr().err
+    # non-synthetic dataset with no local files: same actionable exit 2 as
+    # the single-baseline path (H-5 lifted the synthetic-only guard; real
+    # datasets run when their files exist under --data-dir).  The empty
+    # data dir keeps this hermetic now that the repo ships real datasets.
+    assert main(["--dataset", "locomo", "--compare", "none",
+                 "--data-dir", str(tmp_path)]) == 2
+    assert "not available locally" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

@@ -399,7 +399,7 @@ def test_cli_ablate_multiple_budgets(capsys):
     assert tokens == sorted(tokens) and len(tokens) == 3
 
 
-def test_cli_ablate_invalid_configs(capsys):
+def test_cli_ablate_invalid_configs(capsys, tmp_path):
     assert main(["--dataset", "synthetic", "--ablate", "bogus"]) == 1
     assert "unknown ablation kind" in capsys.readouterr().err
     assert main(["--dataset", "synthetic", "--ablate", "k"]) == 1
@@ -415,9 +415,13 @@ def test_cli_ablate_invalid_configs(capsys):
     # mutually exclusive with --compare
     assert main(["--dataset", "synthetic", "--ablate", "stage", "--compare", "none"]) == 1
     assert "only one" in capsys.readouterr().err
-    # non-synthetic dataset
-    assert main(["--dataset", "locomo", "--ablate", "stage"]) == 2
-    assert "requires --dataset synthetic" in capsys.readouterr().err
+    # non-synthetic dataset with no local files: same actionable exit 2 as
+    # the single-baseline path (H-5 lifted the synthetic-only guard; real
+    # datasets run when their files exist under --data-dir).  The empty
+    # data dir keeps this hermetic now that the repo ships real datasets.
+    assert main(["--dataset", "locomo", "--ablate", "stage",
+                 "--data-dir", str(tmp_path)]) == 2
+    assert "not available locally" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

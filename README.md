@@ -97,13 +97,12 @@ The benchmark resolves them as `<data-dir>/<dataset>/*.json` (`--data-dir`
 defaults to the repository `data/` folder).
 
 **Status of real-dataset runs:** the adapters parse LoCoMo/LongMemEval into
-benchmark cases, but *executing* a strategy on them is currently blocked —
-building the retrieval/answer strategy requires `src/store` (tiered memory
-store) and `src/llm` (`call_llm` for answer generation), which are owned by
-teammates and not available yet; `--compare` / `--ablate` likewise run on
-synthetic data only until that integration lands. The CLI reports this with
-exit code 2 and a message naming the missing module. Everything else
-(single-strategy synthetic runs, comparison, ablation, exports) works today.
+benchmark cases and every mode executes them end-to-end — single-strategy
+runs, `--compare`, and `--ablate` (stage / k / budget / `signal:*`) all build
+the real strategies from `src/store`, `src/llm`, and the selective-memory
+controller. Missing dataset files or a missing runtime dependency (LLM
+provider in `.env`, store embedder) are reported with exit code 2 and a
+message naming what is missing. Everything (synthetic and real) works today.
 
 ## Running
 
@@ -133,26 +132,35 @@ The five strategies:
 | `memory_r1` | Memory-R1-style budgeted baseline (**project-level approximation, not a paper reproduction**) |
 | `hmem` | H-MEM-style hierarchical baseline (**project-level approximation, not a paper reproduction**) |
 
-### Baseline comparison (synthetic only)
+### Baseline comparison (synthetic and real datasets)
 
 ```bash
 python -m src.eval.run_benchmark --dataset synthetic --compare none,full_history,memoryos,memory_r1,hmem
+python -m src.eval.run_benchmark --dataset locomo --compare none,full_history,memoryos,memory_r1,hmem --data-dir data
 ```
 
 Prints one metrics table (F1, BLEU-1, Recall@K, P@K, MRR, tokens, latency)
-with one row per strategy. `--compare` is mutually exclusive with `--ablate`
-and requires `--dataset synthetic` (real datasets return exit 2 for now).
+with one row per strategy. `--compare` is mutually exclusive with `--ablate`;
+on real datasets it needs the dataset files present (see **Datasets**) plus
+the runtime dependencies, otherwise exit 2.
 
-### Ablation experiments (synthetic only)
+### Ablation experiments (synthetic and real datasets)
 
 ```bash
 python -m src.eval.run_benchmark --dataset synthetic --ablate stage            # coarse-only vs two-stage
 python -m src.eval.run_benchmark --dataset synthetic --ablate k:1,3,5          # Stage-1 candidate counts
 python -m src.eval.run_benchmark --dataset synthetic --ablate budget:12,64,512 # token budgets
+python -m src.eval.run_benchmark --dataset synthetic --ablate signal:importance # controller thresholds
+python -m src.eval.run_benchmark --dataset locomo --ablate stage --data-dir data
+python -m src.eval.run_benchmark --dataset locomo --ablate k:1,3,5 --data-dir data
 ```
 
 One family per run (the metric cutoff `--k` stays fixed across configs so
-each ablation varies exactly one factor).
+each ablation varies exactly one factor). `signal:{importance,temporal,
+contradiction,storage}` sweeps the controller's scoring thresholds — on real
+datasets each case's memories are ingested through the real controller
+(`src.controller.controller.process`), so the thresholds genuinely change
+what is stored and therefore the retrieval/QA metrics.
 
 ### JSON / CSV export
 
@@ -176,10 +184,15 @@ exist (write failures exit 2).
 python -m src.eval.run_benchmark --dataset locomo --baseline none --data-dir data
 ```
 
-With the dataset files in place (see **Datasets**), this loads and parses
-LoCoMo, then stops with exit 2 until the store/LLM/controller integration
-above is available; if the files are missing it exits 2 immediately with
-the expected path.
+With the dataset files in place (see **Datasets**) and the runtime
+dependencies available (an LLM provider in `.env` for `call_llm`, plus a
+store embedder — `sentence-transformers` or `fastembed`), this runs the real
+`none` strategy end-to-end: each case gets an isolated `TieredMemoryStore`
+holding that case's own memories (dataset ids preserved), searched by the
+two-stage pipeline and answered via `call_llm`, then reported with
+F1 / BLEU-1 / Recall@K / P@K / MRR / tokens / latency. Missing dataset
+files exit 2 with the expected path; a missing LLM/embedder dependency
+exits 2 with the dependency named.
 
 ## Branching & PRs
 

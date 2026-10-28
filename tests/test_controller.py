@@ -537,10 +537,15 @@ class TestCallLlm:
         import sys, types
         fake_groq_mod = types.ModuleType("groq")
         fake_groq_mod.Groq = object  # type: ignore[attr-defined]
-        sys.modules["groq"] = fake_groq_mod
+        monkeypatch.setitem(sys.modules, "groq", fake_groq_mod)
 
         from src.llm import client
         import importlib; importlib.reload(client)
+        # call_llm() invokes _load_env() which would re-import the REAL
+        # .env (dotenv override=False repopulates the deleted key) and this
+        # test would stop testing a missing key at all.  Disable it so the
+        # deletion above is what the code actually sees.
+        monkeypatch.setattr(client, "_load_env", lambda: None)
         with pytest.raises(EnvironmentError, match="GROQ_API_KEY"):
             client.call_llm("hello")
 
@@ -566,7 +571,12 @@ class TestCallLlm:
         monkeypatch.setenv("GROQ_API_KEY", "fake-key")
 
         import sys
-        sys.modules.pop("groq", None)
+        # Setting the entry to None makes `import groq` raise ImportError
+        # ("... halted; None in sys.modules") — the canonical way to
+        # simulate a missing package.  Popping the key would NOT work: the
+        # real SDK is installed, so the import would succeed and this test
+        # would make a real network call with the fake key (401).
+        monkeypatch.setitem(sys.modules, "groq", None)
 
         from src.llm import client
         import importlib; importlib.reload(client)

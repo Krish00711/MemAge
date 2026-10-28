@@ -101,23 +101,35 @@ def format_full_history(history: Union[str, List, None]) -> str:
     return str(history)
 
 
-def history_from_case(case: BenchmarkCase) -> str:
-    """Extract a case's full history from its adapter-provided metadata.
+def memory_entries_from_case(case: BenchmarkCase) -> List[dict]:
+    """Extract a case's history as individual memory-entry dicts.
 
-    Supports the metadata shapes produced by ``src/eval/adapters.py``:
+    Unlike :func:`history_from_case` (which formats the whole history into
+    one context string), this returns one dict per conversation turn so the
+    entry-based baselines (``memoryos`` / ``memory_r1`` / ``hmem``) can
+    rank, budget, and id-annotate entries individually.
 
-    * LoCoMo: ``metadata["turns"]`` (conversation turns, in order)
-    * LongMemEval: ``metadata["sessions"]`` (zipped sessions; session date
-      is attached to each turn as a timestamp fallback)
+    The original dataset ids are preserved on every entry:
 
-    Returns ``""`` when the case carries no history (e.g. synthetic cases
-    built without metadata), which is a valid empty history.
+    * LoCoMo: each ``metadata["turns"]`` record keeps its ``dia_id`` as
+      ``id`` (e.g. ``"D1:1"``) - the same unit referenced by the case's
+      ``relevant_ids`` (``qa[].evidence``).
+    * LongMemEval: each flattened turn gets ``id = session_id`` - the same
+      unit referenced by the case's ``relevant_ids``
+      (``answer_session_ids``). Session date is attached as ``timestamp``
+      and ``source`` becomes ``"<session_id>:<role>"``.
+
+    Entries are raw (never pre-formatted with ``[Memory N]`` markers);
+    formatting happens exactly once, later, via the shared
+    ``src.retrieval.formatter.format_context``.
+
+    Returns ``[]`` when the case carries no history metadata.
     """
     metadata = getattr(case, "metadata", None) or {}
 
     turns = metadata.get("turns")
     if isinstance(turns, (list, tuple)) and turns:
-        return format_full_history(list(turns))
+        return list(turns)
 
     sessions = metadata.get("sessions")
     if isinstance(sessions, (list, tuple)) and sessions:
@@ -135,15 +147,32 @@ def history_from_case(case: BenchmarkCase) -> str:
                     continue
                 entry = dict(turn)
                 entry.setdefault("timestamp", session_date or "")
+                if session_id:
+                    # Relevance unit for LongMemEval is the session id.
+                    entry.setdefault("id", session_id)
                 if "role" in entry and "source" not in entry:
                     entry["source"] = (
                         f"{session_id}:{entry['role']}" if session_id else entry["role"]
                     )
                 entries.append(entry)
-        if entries:
-            return format_full_history(entries)
+        return entries
 
-    return ""
+    return []
+
+
+def history_from_case(case: BenchmarkCase) -> str:
+    """Extract a case's full history from its adapter-provided metadata.
+
+    Supports the metadata shapes produced by ``src/eval/adapters.py``:
+
+    * LoCoMo: ``metadata["turns"]`` (conversation turns, in order)
+    * LongMemEval: ``metadata["sessions"]`` (zipped sessions; session date
+      is attached to each turn as a timestamp fallback)
+
+    Returns ``""`` when the case carries no history (e.g. synthetic cases
+    built without metadata), which is a valid empty history.
+    """
+    return format_full_history(memory_entries_from_case(case))
 
 
 class FullHistoryBaseline:

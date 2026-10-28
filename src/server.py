@@ -489,16 +489,16 @@ def main(argv=None):
         # Validate LLM provider key early so the error is visible at startup.
         provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
         if not provider:
-            print("[WARN] LLM_PROVIDER not set — defaulting to gemini. "
+            print("[WARN] LLM_PROVIDER not set - defaulting to gemini. "
                   "Copy .env.example to .env and set your key.", file=sys.stderr)
         elif provider == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip():
-            print("[WARN] GEMINI_API_KEY not set — chat will fail. "
+            print("[WARN] GEMINI_API_KEY not set - chat will fail. "
                   "Set it in .env or the environment.", file=sys.stderr)
         elif provider == "groq" and not os.environ.get("GROQ_API_KEY", "").strip():
-            print("[WARN] GROQ_API_KEY not set — chat will fail. "
+            print("[WARN] GROQ_API_KEY not set - chat will fail. "
                   "Set it in .env or the environment.", file=sys.stderr)
         elif provider == "mistral" and not os.environ.get("MISTRAL_API_KEY", "").strip():
-            print("[WARN] MISTRAL_API_KEY not set — chat will fail. "
+            print("[WARN] MISTRAL_API_KEY not set - chat will fail. "
                   "Set it in .env or the environment.", file=sys.stderr)
 
         # Prefer CHROMA_PERSIST_DIR env var over CLI default
@@ -526,7 +526,7 @@ def main(argv=None):
     _agent = MemAgeAgent(_store, llm=llm, token_budget=args.token_budget)
 
     server = HTTPServer(("0.0.0.0", args.port), _Handler)
-    print(f"MemAge server → http://localhost:{args.port}")
+    print(f"MemAge server -> http://localhost:{args.port}")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
