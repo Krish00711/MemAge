@@ -22,8 +22,20 @@ import time
 # Default model names — override via env if needed
 # ---------------------------------------------------------------------------
 _DEFAULT_GEMINI_MODEL  = "gemini-1.5-flash"
-_DEFAULT_GROQ_MODEL    = "llama3-8b-8192"
+# llama-3.1-8b-instant was shut down by Groq on 2026-08-16; gpt-oss-20b is the
+# recommended replacement.
+_DEFAULT_GROQ_MODEL    = "openai/gpt-oss-20b"
 _DEFAULT_MISTRAL_MODEL = "mistral-small-latest"
+
+
+class LLMRateLimitError(RuntimeError):
+    """Raised when a provider rate limit cannot be recovered by a short wait.
+
+    Subclasses RuntimeError so existing ``except RuntimeError`` code keeps
+    working.  Benchmark scripts can catch this specifically to save progress
+    and stop cleanly (e.g. when the Groq daily token cap is hit) instead of
+    recording an error string as a model answer.
+    """
 
 
 def _load_env() -> None:
@@ -43,12 +55,13 @@ def call_llm(prompt: str, system: str | None = None, **kwargs) -> str:
     prompt:
         User-facing prompt string.
     system:
-        Optional system instruction.  Gemini receives it as the first
-        ``"user"`` turn prefixed with a newline separator; Groq receives it
-        as a ``{"role": "system", ...}`` message.
+        Optional system instruction.  Gemini receives it prepended to the
+        prompt; Groq/Mistral receive it as a ``{"role": "system", ...}``
+        message.
     **kwargs:
-        Forwarded to the underlying SDK call (e.g. ``temperature``).
-        Unknown kwargs are silently ignored if the SDK does not accept them.
+        Forwarded to the underlying SDK call.  Supported: ``temperature`` (all
+        providers) and ``max_tokens`` / ``max_completion_tokens`` (Groq).
+        Unknown kwargs are silently ignored.
 
     Returns
     -------
@@ -61,6 +74,8 @@ def call_llm(prompt: str, system: str | None = None, **kwargs) -> str:
         If the required API key is missing from the environment.
     ImportError
         If the required provider SDK is not installed.
+    LLMRateLimitError
+        If a rate limit cannot be recovered with a short wait (Groq).
     RuntimeError
         If the provider call fails or returns an empty response.
     """
@@ -139,25 +154,44 @@ def _call_gemini(prompt: str, system: str | None, **kwargs) -> str:
 # Groq
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Transient rate-limit retry (Groq TPM is tight: 8000 tokens/min on the
-# free tier).  A rejected 429 consumes no quota, so a short bounded retry
-# turns a transient TPM blip into a success instead of a permanent
-# "[LLM error: ...]" answer.  Non-rate-limit errors are never retried.
-# ---------------------------------------------------------------------------
+# Transient rate-limit retry.  Groq's free tier has tight per-minute token
+# limits (TPM) and per-day limits (TPD/RPD).  A rejected 429 consumes no quota,
+# so a bounded wait turns a transient TPM blip into a success.  If the
+# provider asks us to wait longer than _MAX_WAIT_SECONDS (typically the daily
+# cap), we raise LLMRateLimitError so the caller can checkpoint and stop.
 
-_RATE_LIMIT_RE = re.compile(r"try again in ([\d.]+)s", re.IGNORECASE)
-_MAX_RATE_RETRIES = 3
+_MAX_RATE_RETRIES = int(os.environ.get("LLM_MAX_RATE_RETRIES", "6"))
+_MAX_WAIT_SECONDS = float(os.environ.get("LLM_MAX_WAIT_SECONDS", "90"))
+
+# Matches hints such as "try again in 2.5s", "7m12.96s", "1h2m3s", "850ms".
+_RETRY_HINT_RE = re.compile(
+    r"try again in\s+((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)", re.IGNORECASE
+)
+_DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)", re.IGNORECASE)
+_UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+
+
+def _parse_duration(text: str) -> float:
+    """Convert a duration like '7m12.96s' into seconds."""
+    return sum(
+        float(value) * _UNIT_SECONDS[unit.lower()]
+        for value, unit in _DURATION_PART_RE.findall(text)
+    )
+
+
+def _is_rate_limit(message: str) -> bool:
+    low = message.lower()
+    return "429" in message or "rate_limit" in low or "rate limit" in low
 
 
 def _rate_limit_delay(message: str, attempt: int) -> float | None:
-    """Seconds to wait for a transient rate-limit error, else ``None``."""
-    if "429" not in message and "rate_limit" not in message.lower():
+    """Seconds to wait for a rate-limit error, else ``None`` if not one."""
+    if not _is_rate_limit(message):
         return None
-    match = _RATE_LIMIT_RE.search(message)
+    match = _RETRY_HINT_RE.search(message)
     if match:
         # Honour the provider's own hint, with a small safety margin.
-        return min(float(match.group(1)) + 0.5, 30.0)
+        return _parse_duration(match.group(1)) + 0.5
     # No hint: exponential backoff (2s, 4s, 8s, ... capped at 30s).
     return min(2.0 * (2 ** attempt), 30.0)
 
@@ -168,7 +202,7 @@ def _call_groq(prompt: str, system: str | None, **kwargs) -> str:
     except ImportError as exc:
         raise ImportError(
             "groq is not installed. "
-            "Run: pip install groq==0.9.0"
+            "Run: pip install -U groq"
         ) from exc
 
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -178,17 +212,28 @@ def _call_groq(prompt: str, system: str | None, **kwargs) -> str:
             "Copy .env.example to .env and add your key."
         )
 
-    model_name = os.environ.get("GROQ_MODEL", _DEFAULT_GROQ_MODEL)
+    model_name = os.environ.get("GROQ_MODEL", _DEFAULT_GROQ_MODEL).strip()
 
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    # Forward temperature if supplied
     create_kwargs: dict = {}
     if "temperature" in kwargs:
         create_kwargs["temperature"] = kwargs["temperature"]
+
+    # Groq's parameter is max_completion_tokens; accept the common alias too.
+    max_tokens = kwargs.get("max_completion_tokens", kwargs.get("max_tokens"))
+    if max_tokens:
+        create_kwargs["max_completion_tokens"] = max_tokens
+
+    # gpt-oss models are reasoning models: keep reasoning short so that
+    # extraction / controller calls stay fast and don't burn the token budget.
+    if model_name.startswith("openai/gpt-oss"):
+        create_kwargs["extra_body"] = {
+            "reasoning_effort": os.environ.get("GROQ_REASONING_EFFORT", "low")
+        }
 
     client = Groq(api_key=api_key)
     completion = None
@@ -202,8 +247,14 @@ def _call_groq(prompt: str, system: str | None, **kwargs) -> str:
             break
         except Exception as exc:
             delay = _rate_limit_delay(str(exc), attempt)
-            if delay is None or attempt == _MAX_RATE_RETRIES:
+            if delay is None:
+                # Not a rate-limit error: never retry.
                 raise RuntimeError(f"Groq API call failed: {exc}") from exc
+            if delay > _MAX_WAIT_SECONDS or attempt == _MAX_RATE_RETRIES:
+                raise LLMRateLimitError(
+                    f"Groq rate limit not recoverable (wait={delay:.0f}s, "
+                    f"attempt={attempt + 1}): {exc}"
+                ) from exc
             time.sleep(delay)
     if completion is None:  # pragma: no cover - loop always sets or raises
         raise RuntimeError("Groq API call failed: no completion produced.")
@@ -214,7 +265,11 @@ def _call_groq(prompt: str, system: str | None, **kwargs) -> str:
         raise RuntimeError(f"Groq returned an unexpected response structure: {exc}") from exc
 
     if not text or not text.strip():
-        raise RuntimeError("Groq returned an empty response.")
+        raise RuntimeError(
+            "Groq returned an empty response (if using a reasoning model, the "
+            "token budget may have been consumed by reasoning; raise max_tokens "
+            "or lower GROQ_REASONING_EFFORT)."
+        )
 
     return text.strip()
 
