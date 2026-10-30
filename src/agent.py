@@ -64,6 +64,9 @@ class AgentResponse:
     turn_result: TurnResult | None  # ingestion result (None on ingestion error)
     ok: bool                    # False if answer generation itself raised
     error: str | None = None    # exception message when ok=False
+    retrieval_trace: list = field(default_factory=list)
+    """Per-memory retrieval trace (id, score, stage1_rank, tier, text preview)
+    for memories that reached the answer prompt — observability only."""
 
 
 # ---------------------------------------------------------------------------
@@ -168,14 +171,18 @@ class MemAgeAgent:
         # ------------------------------------------------------------------
         context = ""
         retrieved_ids: list[str] = []
+        retrieval_trace: list[dict] = []
         try:
-            context, retrieved_ids = self._retrieval_ctx.retrieve_ranked(
-                message, self._token_budget
+            context, retrieved_ids, retrieval_trace = (
+                self._retrieval_ctx.retrieve_with_trace(
+                    message, self._token_budget
+                )
             )
         except Exception:
             # Retrieval failure is non-fatal — proceed with empty context.
             context = ""
             retrieved_ids = []
+            retrieval_trace = []
 
         # ------------------------------------------------------------------
         # Step 2 — Generate answer
@@ -223,6 +230,7 @@ class MemAgeAgent:
             turn_result=turn_result,
             ok=answer_ok,
             error=answer_error,
+            retrieval_trace=retrieval_trace,
         )
 
     # ------------------------------------------------------------------

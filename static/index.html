@@ -3,473 +3,1324 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MemAge — Selective Memory Agent</title>
+<title>MemAge — Selective Memory Observability</title>
 <style>
-:root {
-  --bg: #0f1117;
-  --surface: #1a1d27;
-  --surface2: #22263a;
-  --border: #2e3347;
-  --accent: #5b8df6;
-  --accent2: #7c6af7;
-  --green: #34d399;
-  --yellow: #fbbf24;
-  --red: #f87171;
-  --text: #e2e8f0;
-  --muted: #8892a4;
-  --radius: 10px;
-  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+:root{
+  --bg:#0d1013;
+  --panel:#14181d;
+  --panel2:#191e24;
+  --panel3:#1f252d;
+  --border:#242b34;
+  --border2:#2e3742;
+  --text:#e7eaef;
+  --muted:#8d96a5;
+  --dim:#626c7c;
+  --teal:#2dd4bf;
+  --cyan:#38bdf8;
+  --violet:#9d9ede;
+  --green:#34d399;
+  --amber:#fbbf24;
+  --red:#f87171;
+  --radius:12px;
+  --mono:ui-monospace,'Cascadia Code','JetBrains Mono',Menlo,Consolas,monospace;
 }
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif;
-       font-size: 14px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg);color:var(--text);
+  font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  font-size:14px;line-height:1.45;overflow:hidden;
+}
+button{font-family:inherit}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:#2a323c;border-radius:4px}
+::-webkit-scrollbar-track{background:transparent}
 
-/* ── Top bar ── */
-#topbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
-          background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
-#topbar h1 { font-size: 16px; font-weight: 700; background: linear-gradient(90deg, var(--accent), var(--accent2));
-             -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-#health-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-#health-dot.ok { background: var(--green); }
-#health-dot.err { background: var(--red); }
-#health-info { font-size: 12px; color: var(--muted); }
-#topbar-right { margin-left: auto; display: flex; gap: 8px; }
-button.btn { padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border);
-             background: var(--surface2); color: var(--text); cursor: pointer; font-size: 13px; }
-button.btn:hover { border-color: var(--accent); color: var(--accent); }
-button.btn.danger { color: var(--red); }
-button.btn.danger:hover { border-color: var(--red); }
+/* ── Shell ─────────────────────────────────────────── */
+#app{display:flex;height:100vh}
+#sidebar{
+  width:236px;flex-shrink:0;background:var(--panel);
+  border-right:1px solid var(--border);
+  display:flex;flex-direction:column;padding:18px 14px;
+}
+.brand{display:flex;gap:11px;align-items:center;padding:4px 6px 20px}
+.brand-mark{
+  width:34px;height:34px;border-radius:9px;flex-shrink:0;
+  background:linear-gradient(135deg,#1b7f75,#2dd4bf 55%,#38bdf8);
+  color:#07110f;font-weight:800;font-size:17px;
+  display:flex;align-items:center;justify-content:center;
+}
+.brand-name{font-size:16px;font-weight:700;letter-spacing:.3px}
+.brand-sub{font-size:10.5px;color:var(--dim);letter-spacing:.6px;text-transform:uppercase}
 
-/* ── Main layout ── */
-#main { display: flex; flex: 1; overflow: hidden; }
+#nav{display:flex;flex-direction:column;gap:3px;flex:1}
+.nav-btn{
+  display:flex;align-items:center;gap:10px;
+  background:none;border:1px solid transparent;border-radius:9px;
+  color:var(--muted);font-size:13.5px;padding:9px 11px;
+  cursor:pointer;text-align:left;transition:all .15s;
+}
+.nav-btn .ic{width:16px;text-align:center;font-size:13px;opacity:.9}
+.nav-btn:hover{background:var(--panel2);color:var(--text)}
+.nav-btn.active{
+  background:var(--panel3);border-color:var(--border2);
+  color:var(--teal);font-weight:600;
+}
 
-/* ── Left: chat ── */
-#chat-panel { width: 42%; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
-#messages { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
-.msg { max-width: 85%; border-radius: var(--radius); padding: 10px 13px; line-height: 1.5; }
-.msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
-.msg.agent { align-self: flex-start; background: var(--surface2); border-bottom-left-radius: 3px; }
-.msg.system { align-self: center; font-size: 12px; color: var(--muted); background: none; padding: 4px 0; }
-.msg .refs { margin-top: 6px; font-size: 11px; color: var(--muted); }
-.msg .refs span { background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
-                  padding: 1px 5px; margin-right: 4px; cursor: pointer; }
-.msg .refs span:hover { border-color: var(--accent); color: var(--accent); }
-.typing { opacity: .5; font-style: italic; font-size: 13px; }
-#chat-input-row { display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--border); }
-#chat-input { flex: 1; background: var(--surface2); border: 1px solid var(--border);
-              border-radius: 8px; color: var(--text); padding: 8px 12px; font-size: 14px;
-              resize: none; min-height: 40px; max-height: 120px; outline: none; font-family: inherit; }
-#chat-input:focus { border-color: var(--accent); }
-#send-btn { background: var(--accent); border: none; border-radius: 8px; color: #fff;
-            padding: 0 16px; cursor: pointer; font-size: 18px; }
-#send-btn:hover { filter: brightness(1.1); }
-#send-btn:disabled { opacity: .4; cursor: default; }
-#session-row { display: flex; gap: 6px; align-items: center; padding: 6px 10px 0;
-               font-size: 12px; color: var(--muted); }
-#session-input { background: var(--surface2); border: 1px solid var(--border);
-                 border-radius: 5px; color: var(--text); padding: 3px 8px; font-size: 12px; width: 120px; }
+.sysbox{
+  background:var(--panel2);border:1px solid var(--border);
+  border-radius:10px;padding:11px 12px;font-size:11.5px;color:var(--muted);
+}
+.sysbox .row{display:flex;justify-content:space-between;gap:8px;padding:2.5px 0}
+.sysbox .row b{color:var(--text);font-weight:600;font-size:11.5px}
+.sysbox .head{display:flex;align-items:center;gap:7px;margin-bottom:7px;
+  padding-bottom:7px;border-bottom:1px solid var(--border);font-size:11px;
+  letter-spacing:.7px;text-transform:uppercase;color:var(--dim)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex-shrink:0}
+.dot.ok{background:var(--green);box-shadow:0 0 6px rgba(52,211,153,.55)}
+.dot.err{background:var(--red);box-shadow:0 0 6px rgba(248,113,113,.55)}
+.mono{font-family:var(--mono)}
 
-/* ── Right: tabs ── */
-#right-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-#tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
-.tab { padding: 9px 16px; cursor: pointer; font-size: 13px; color: var(--muted); border-bottom: 2px solid transparent; }
-.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-.tab-content { display: none; flex: 1; overflow-y: auto; padding: 12px; }
-.tab-content.active { display: flex; flex-direction: column; gap: 8px; }
+/* ── Main / views ──────────────────────────────────── */
+#main{flex:1;display:flex;flex-direction:column;min-width:0}
+#topbar{
+  display:flex;align-items:center;gap:14px;
+  padding:14px 22px;border-bottom:1px solid var(--border);
+  background:rgba(20,24,29,.7);flex-shrink:0;
+}
+#view-title{font-size:16.5px;font-weight:700}
+#view-sub{font-size:12px;color:var(--dim);margin-top:1px}
+#topbar-right{margin-left:auto;display:flex;gap:8px;align-items:center}
+.view{display:none;flex:1;overflow-y:auto;padding:20px 22px 40px}
+.view.active{display:block}
 
-/* ── Memory explorer ── */
-#mem-toolbar { display: flex; gap: 8px; flex-shrink: 0; }
-#mem-search { flex: 1; background: var(--surface2); border: 1px solid var(--border);
-              border-radius: 6px; color: var(--text); padding: 6px 10px; font-size: 13px; outline: none; }
-#mem-search:focus { border-color: var(--accent); }
-.tier-tabs { display: flex; gap: 4px; }
-.tier-btn { padding: 4px 10px; border-radius: 5px; border: 1px solid var(--border);
-            background: var(--surface2); color: var(--muted); cursor: pointer; font-size: 12px; }
-.tier-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-.mem-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px;
-            padding: 10px 12px; cursor: pointer; }
-.mem-card:hover { border-color: var(--accent); }
-.mem-card .mem-text { font-size: 13px; margin-bottom: 5px; }
-.mem-card .mem-meta { font-size: 11px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
-.tier-badge { padding: 1px 7px; border-radius: 20px; font-size: 11px; font-weight: 600; }
-.tier-STM { background: #1e3a5f; color: #60a5fa; }
-.tier-MTM { background: #2d2a1a; color: #fbbf24; }
-.tier-LTM { background: #1e2d1e; color: #34d399; }
-.empty-state { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
+#toast{
+  display:none;position:fixed;top:14px;left:50%;transform:translateX(-50%);
+  background:#3b1414;border:1px solid #7f1d1d;color:#fca5a5;
+  padding:9px 16px;border-radius:8px;font-size:12.5px;z-index:99;
+  max-width:70vw;text-align:center;
+}
+#toast.ok{background:#0d2b22;border-color:#165c4a;color:#6ee7b7}
 
-/* ── Capacity bar ── */
-.cap-row { display: flex; flex-direction: column; gap: 4px; }
-.cap-label { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
-.cap-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
-.cap-fill { height: 100%; border-radius: 3px; background: var(--accent); transition: width .3s; }
-.cap-fill.warn { background: var(--yellow); }
-.cap-fill.full { background: var(--red); }
+/* ── Cards / grid ──────────────────────────────────── */
+.card{
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:var(--radius);padding:16px;
+}
+.card h3{font-size:12px;font-weight:700;letter-spacing:.9px;
+  text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+.grid{display:grid;gap:13px}
+.g2{grid-template-columns:1fr 1fr}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g4{grid-template-columns:repeat(4,1fr)}
+.section{margin-bottom:20px}
+.hint{font-size:12px;color:var(--dim)}
+.badge{
+  display:inline-block;padding:1.5px 8px;border-radius:20px;
+  font-size:10.5px;font-weight:700;letter-spacing:.4px;
+}
+.b-teal{background:#0e3b36;color:var(--teal)}
+.b-cyan{background:#0d2f42;color:var(--cyan)}
+.b-violet{background:#26264f;color:#b7b8f0}
+.b-amber{background:#3a2f0d;color:var(--amber)}
+.b-red{background:#3b1414;color:#fca5a5}
+.b-grey{background:var(--panel3);color:var(--muted)}
 
-/* ── Decision inspector ── */
-.decision-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
-.decision-card .action { font-weight: 700; font-size: 14px; margin-bottom: 8px; }
-.action-ADD { color: var(--green); }
-.action-UPDATE { color: var(--yellow); }
-.action-DELETE { color: var(--red); }
-.action-NOOP { color: var(--muted); }
-.score-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.score-label { font-size: 12px; color: var(--muted); width: 140px; flex-shrink: 0; }
-.score-bar { flex: 1; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
-.score-fill { height: 100%; border-radius: 3px; background: var(--accent2); }
-.score-val { font-size: 12px; color: var(--text); width: 36px; text-align: right; flex-shrink: 0; font-family: var(--mono); }
+.stat .lbl{font-size:10.5px;letter-spacing:.8px;text-transform:uppercase;color:var(--dim)}
+.stat .val{font-size:26px;font-weight:700;margin-top:6px;line-height:1.1;font-family:var(--mono)}
+.stat .sub{font-size:11.5px;color:var(--muted);margin-top:5px}
+.stat .accent{width:26px;height:3px;border-radius:2px;margin-bottom:9px}
 
-/* ── Timeline ── */
-.timeline-event { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0;
-                  border-bottom: 1px solid var(--border); }
-.tl-action { font-size: 11px; font-weight: 700; width: 60px; flex-shrink: 0; padding-top: 1px; }
-.tl-text { font-size: 13px; flex: 1; }
-.tl-ts { font-size: 11px; color: var(--muted); white-space: nowrap; }
+/* tier bars */
+.tierbar{margin-bottom:11px}
+.tierbar .lab{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:5px}
+.tierbar .lab b{color:var(--text);font-family:var(--mono);font-weight:600}
+.bar{height:7px;background:var(--panel3);border-radius:4px;overflow:hidden}
+.bar i{display:block;height:100%;border-radius:4px;transition:width .4s ease}
+.fill-stm{background:var(--cyan)}
+.fill-mtm{background:var(--violet)}
+.fill-ltm{background:var(--teal)}
 
-/* ── Scrollbar ── */
-::-webkit-scrollbar { width: 5px; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+/* metric chart */
+.mchart .mrow{display:grid;grid-template-columns:150px 1fr 62px;gap:10px;
+  align-items:center;margin-bottom:8px;font-size:12.5px}
+.mchart .mname{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mchart .mtrack{background:var(--panel3);border-radius:4px;height:16px;position:relative;overflow:hidden}
+.mchart .mfill{position:absolute;left:0;top:0;bottom:0;border-radius:4px;
+  background:linear-gradient(90deg,rgba(56,189,248,.85),rgba(45,212,191,.85))}
+.mchart .mval{font-family:var(--mono);font-size:12px;text-align:right;color:var(--text)}
 
-/* ── Modal ── */
-#modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100; align-items: center; justify-content: center; }
-#modal-overlay.visible { display: flex; }
-#modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-         padding: 24px; max-width: 420px; width: 90%; }
-#modal h2 { font-size: 15px; margin-bottom: 10px; }
-#modal p { font-size: 13px; color: var(--muted); margin-bottom: 18px; line-height: 1.6; }
-#modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+/* tables */
+table.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tbl th{
+  text-align:left;font-size:10.5px;letter-spacing:.7px;text-transform:uppercase;
+  color:var(--dim);font-weight:700;padding:7px 9px;border-bottom:1px solid var(--border2);
+}
+.tbl td{padding:8px 9px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:12px}
+.tbl td.name{font-family:inherit;font-weight:600;color:var(--text)}
+.tbl tr:last-child td{border-bottom:none}
+.tbl td.na{color:var(--dim)}
+.tbl tr.pending td{color:var(--dim);font-style:italic}
 
-/* ── Error banner ── */
-#error-banner { display: none; position: fixed; top: 52px; left: 0; right: 0; padding: 8px 16px;
-                background: #7f1d1d; color: #fca5a5; font-size: 13px; z-index: 50; text-align: center; }
+/* ── Chat ──────────────────────────────────────────── */
+#chat-wrap{display:grid;grid-template-columns:1fr 330px;gap:14px;height:calc(100vh - 118px)}
+#chat-panel{display:flex;flex-direction:column;min-height:0}
+#chat-messages{flex:1;overflow-y:auto;padding:16px;display:flex;
+  flex-direction:column;gap:12px;min-height:0}
+.msg{max-width:86%;border-radius:12px;padding:11px 14px;line-height:1.55;
+  border:1px solid var(--border);white-space:pre-wrap;word-break:break-word}
+.msg.user{align-self:flex-end;background:#123c3a;border-color:#1b5e57;color:#d8fffa}
+.msg.agent{align-self:flex-start;background:var(--panel2)}
+.msg.sys{align-self:center;background:none;border:none;color:var(--dim);font-size:12px;padding:2px}
+.msg .meta{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:7px}
+.chip{font-size:10.5px;font-family:var(--mono);padding:1.5px 7px;border-radius:5px;
+  background:var(--panel3);border:1px solid var(--border2);color:var(--muted)}
+.msg .refs{margin-top:9px;padding-top:8px;border-top:1px dashed var(--border2)}
+.refbtn{
+  display:inline-block;font-size:10.5px;font-family:var(--mono);
+  background:var(--panel3);border:1px solid var(--border2);color:var(--cyan);
+  border-radius:5px;padding:2px 7px;margin:2.5px 4px 0 0;cursor:pointer;
+}
+.refbtn:hover{border-color:var(--cyan)}
+.msg details{margin-top:8px}
+.msg summary{font-size:11px;color:var(--dim);cursor:pointer;user-select:none}
+.msg details pre{font-family:var(--mono);font-size:11px;color:var(--muted);
+  background:var(--bg);border:1px solid var(--border);border-radius:7px;
+  padding:8px;margin-top:6px;white-space:pre-wrap;max-height:180px;overflow:auto}
+.trace-tbl{width:100%;font-size:11px;margin-top:6px;border-collapse:collapse}
+.trace-tbl th{font-size:9.5px;color:var(--dim);text-align:left;padding:3px 5px}
+.trace-tbl td{font-family:var(--mono);font-size:11px;padding:3px 5px;
+  border-top:1px solid var(--border);color:var(--muted)}
+#chat-input-row{display:flex;gap:9px;padding:12px;border-top:1px solid var(--border)}
+#chat-input{
+  flex:1;background:var(--panel2);border:1px solid var(--border2);border-radius:9px;
+  color:var(--text);padding:10px 13px;font-size:14px;resize:none;min-height:42px;
+  max-height:130px;outline:none;font-family:inherit;
+}
+#chat-input:focus{border-color:#1f6f66}
+#chat-send{
+  background:var(--teal);border:none;border-radius:9px;color:#04211d;
+  font-weight:700;padding:0 20px;cursor:pointer;font-size:13.5px;
+}
+#chat-send:disabled{opacity:.45;cursor:default}
+#chat-side{display:flex;flex-direction:column;gap:13px;min-height:0;overflow-y:auto}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid var(--border2);
+  border-top-color:var(--teal);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+
+/* ── Memory architecture ───────────────────────────── */
+.tierflow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;align-items:center;gap:12px}
+.tierflow .tierbox{
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:var(--radius);padding:14px;min-width:0;
+}
+.tierflow .arrow{color:var(--dim);font-size:19px}
+.tierflow .tierbox h4{display:flex;align-items:center;gap:8px;font-size:13.5px;margin-bottom:3px}
+.tierflow .tierbox .cap{font-size:11.5px;color:var(--muted);margin-bottom:9px}
+.memcols{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin-top:14px}
+.memcol .colhead{font-size:11px;letter-spacing:.7px;text-transform:uppercase;
+  color:var(--dim);margin-bottom:9px;display:flex;justify-content:space-between}
+.memcard{
+  background:var(--panel2);border:1px solid var(--border);border-radius:9px;
+  padding:10px 11px;margin-bottom:9px;cursor:pointer;transition:border-color .15s;
+}
+.memcard:hover{border-color:var(--border2)}
+.memcard .t{font-size:12.5px;margin-bottom:6px;line-height:1.45}
+.memcard .m{display:flex;gap:10px;flex-wrap:wrap;font-size:10.5px;color:var(--dim);font-family:var(--mono)}
+.memcard .del{color:var(--red);cursor:pointer;float:right;font-size:11px}
+.empty{color:var(--dim);font-size:12.5px;padding:18px;text-align:center;
+  background:var(--panel);border:1px dashed var(--border);border-radius:9px}
+
+/* ── Pipeline ──────────────────────────────────────── */
+.pipe{display:flex;flex-wrap:wrap;gap:7px;align-items:stretch}
+.stage{
+  flex:1;min-width:132px;background:var(--panel);border:1px solid var(--border);
+  border-radius:10px;padding:11px 11px 12px;position:relative;
+}
+.stage .num{font-size:9.5px;font-family:var(--mono);color:var(--dim);letter-spacing:1px}
+.stage .nm{font-size:12.3px;font-weight:650;margin-top:4px;line-height:1.3}
+.stage .ds{font-size:10.7px;color:var(--muted);margin-top:5px;line-height:1.42}
+.stage .edge{position:absolute;right:-7px;top:50%;transform:translateY(-50%);
+  color:var(--border2);font-size:12px;z-index:2}
+.stage:last-child .edge{display:none}
+.badges{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0 14px}
+.eventlist{display:flex;flex-direction:column;gap:8px}
+.event{
+  display:grid;grid-template-columns:74px 1fr auto;gap:11px;
+  background:var(--panel2);border:1px solid var(--border);border-radius:9px;
+  padding:9px 11px;font-size:12.3px;
+}
+.event .act{font-size:10.5px;font-weight:800;letter-spacing:.6px;padding-top:1px}
+.act-ADD{color:var(--green)} .act-UPDATE{color:var(--amber)}
+.act-DELETE{color:var(--red)} .act-NOOP{color:var(--dim)}
+.event .ts{font-size:10.5px;color:var(--dim);font-family:var(--mono)}
+.scorerow{display:flex;align-items:center;gap:7px;margin-top:5px;font-size:11px;color:var(--muted)}
+.scorerow .sl{width:118px;flex-shrink:0}
+.scorerow .sb{flex:1;height:5px;background:var(--panel3);border-radius:3px;overflow:hidden}
+.scorerow .sf{height:100%;background:var(--violet);border-radius:3px}
+.scorerow .sv{font-family:var(--mono);width:44px;text-align:right;color:var(--text);font-size:11px}
+
+/* ── Controls ──────────────────────────────────────── */
+.ctrls{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
+select.inp,input.inp{
+  background:var(--panel2);border:1px solid var(--border2);border-radius:8px;
+  color:var(--text);padding:7px 10px;font-size:13px;outline:none;font-family:inherit;
+}
+select.inp:focus,input.inp:focus{border-color:#1f6f66}
+.btn{
+  background:var(--panel3);border:1px solid var(--border2);color:var(--text);
+  border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer;transition:all .15s;
+}
+.btn:hover{border-color:var(--teal);color:var(--teal)}
+.btn.primary{background:#123c3a;border-color:#1b5e57;color:var(--teal);font-weight:650}
+.btn.primary:hover{background:#16544d}
+.btn.danger{color:var(--red)}
+.btn.danger:hover{border-color:var(--red)}
+.btn:disabled{opacity:.45;cursor:default;pointer-events:none}
+.tabs{display:flex;gap:5px;margin-bottom:14px;flex-wrap:wrap}
+.tab{
+  background:var(--panel);border:1px solid var(--border);color:var(--muted);
+  padding:6px 14px;border-radius:8px;font-size:12.5px;cursor:pointer;
+}
+.tab.active{background:var(--panel3);border-color:#1f6f66;color:var(--teal);font-weight:650}
+.checks{display:flex;gap:12px;flex-wrap:wrap;font-size:12.5px;color:var(--muted)}
+.checks label{display:flex;gap:6px;align-items:center;cursor:pointer}
+.checks input{accent-color:var(--teal)}
+.job{
+  background:var(--panel2);border:1px solid var(--border);border-radius:9px;
+  padding:10px 12px;margin-bottom:9px;font-size:12.3px;
+}
+.job .jhead{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+.job .jname{font-family:var(--mono);font-size:11.5px;color:var(--cyan)}
+.job .jlog{
+  font-family:var(--mono);font-size:10.8px;color:var(--muted);background:var(--bg);
+  border:1px solid var(--border);border-radius:7px;padding:8px;margin-top:8px;
+  max-height:210px;overflow:auto;white-space:pre-wrap;
+}
+.legend{font-size:11.5px;color:var(--dim);margin-top:8px;display:flex;gap:14px;flex-wrap:wrap}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.form-note{font-size:11.5px;color:var(--dim);margin-top:7px}
+
+/* modal */
+#modal-overlay{display:none;position:fixed;inset:0;background:rgba(3,5,7,.72);
+  z-index:100;align-items:center;justify-content:center}
+#modal-overlay.visible{display:flex}
+#modal{background:var(--panel);border:1px solid var(--border2);border-radius:14px;
+  padding:24px;max-width:440px;width:92%}
+#modal h2{font-size:15px;margin-bottom:9px}
+#modal p{font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.6}
+#modal-actions{display:flex;gap:9px;justify-content:flex-end}
+
+@media (max-width:1080px){
+  .g4{grid-template-columns:repeat(2,1fr)}
+  .g3{grid-template-columns:1fr}
+  #chat-wrap{grid-template-columns:1fr;grid-template-rows:1fr auto}
+  #chat-side{display:none}
+  .memcols{grid-template-columns:1fr}
+  .tierflow{grid-template-columns:1fr}
+  .tierflow .arrow{display:none}
+}
 </style>
 </head>
 <body>
 
-<div id="error-banner"></div>
+<div id="toast"></div>
 
-<div id="topbar">
-  <div id="health-dot"></div>
-  <h1>MemAge</h1>
-  <span id="health-info">connecting…</span>
-  <div id="topbar-right">
-    <button class="btn" onclick="refreshMemories()">↻ Refresh</button>
-    <button class="btn danger" onclick="showResetModal()">⚠ Reset</button>
-  </div>
-</div>
-
-<div id="main">
-  <!-- Chat panel -->
-  <div id="chat-panel">
-    <div id="session-row">
-      Session: <input id="session-input" value="web" />
+<div id="app">
+  <!-- ── Sidebar ─────────────────────────────────── -->
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">M</div>
+      <div>
+        <div class="brand-name">MemAge</div>
+        <div class="brand-sub">Selective Memory</div>
+      </div>
     </div>
-    <div id="messages"></div>
-    <div id="chat-input-row">
-      <textarea id="chat-input" rows="1" placeholder="Ask anything about what you've told me…"
-                onkeydown="onKey(event)"></textarea>
-      <button id="send-btn" onclick="sendMessage()">➤</button>
+    <nav id="nav">
+      <button class="nav-btn active" data-view="overview"><span class="ic">◱</span> Overview</button>
+      <button class="nav-btn" data-view="chat"><span class="ic">◈</span> AI Chat</button>
+      <button class="nav-btn" data-view="memory"><span class="ic">▤</span> Memory Architecture</button>
+      <button class="nav-btn" data-view="pipeline"><span class="ic">⇥</span> Pipeline Monitor</button>
+      <button class="nav-btn" data-view="evaluation"><span class="ic">▧</span> Evaluation</button>
+      <button class="nav-btn" data-view="ablation"><span class="ic">◫</span> Ablation Studies</button>
+    </nav>
+    <div class="sysbox" id="sysbox">
+      <div class="head"><span class="dot" id="sys-dot"></span> System status</div>
+      <div class="row"><span>Provider</span><b id="sys-provider">…</b></div>
+      <div class="row"><span>Model</span><b id="sys-model">…</b></div>
+      <div class="row"><span>Token budget</span><b id="sys-budget" class="mono">—</b></div>
+      <div class="row"><span>Retrieval k</span><b id="sys-k" class="mono">—</b></div>
+      <div class="row"><span>Store</span><b id="sys-store" class="mono">—</b></div>
     </div>
-  </div>
+  </aside>
 
-  <!-- Right panel -->
-  <div id="right-panel">
-    <div id="tabs">
-      <div class="tab active" onclick="switchTab('memories', this)">Memories</div>
-      <div class="tab" onclick="switchTab('decisions', this)">Decisions</div>
-      <div class="tab" onclick="switchTab('timeline', this)">Timeline</div>
-      <div class="tab" onclick="switchTab('capacity', this)">Capacity</div>
-    </div>
+  <!-- ── Main ────────────────────────────────────── -->
+  <main id="main">
+    <header id="topbar">
+      <div>
+        <h1 id="view-title">Overview</h1>
+        <div id="view-sub">Live system state — every number comes from the backend</div>
+      </div>
+      <div id="topbar-right">
+        <button class="btn" onclick="refreshAll()">↻ Refresh</button>
+        <button class="btn danger" onclick="showReset()">⚠ Reset memories</button>
+      </div>
+    </header>
 
-    <!-- Memories tab -->
-    <div id="tab-memories" class="tab-content active">
-      <div id="mem-toolbar">
-        <input id="mem-search" placeholder="Search memories…" oninput="refreshMemories()" />
-        <div class="tier-tabs">
-          <button class="tier-btn active" onclick="setTier('all', this)">All</button>
-          <button class="tier-btn" onclick="setTier('STM', this)">STM</button>
-          <button class="tier-btn" onclick="setTier('MTM', this)">MTM</button>
-          <button class="tier-btn" onclick="setTier('LTM', this)">LTM</button>
+    <!-- ════════ OVERVIEW ════════ -->
+    <section id="view-overview" class="view active">
+      <div class="grid g4 section">
+        <div class="card stat">
+          <div class="accent" style="background:var(--teal)"></div>
+          <div class="lbl">Total memories</div>
+          <div class="val" id="ov-total">—</div>
+          <div class="sub" id="ov-total-sub">across all tiers</div>
+        </div>
+        <div class="card stat">
+          <div class="accent" style="background:var(--cyan)"></div>
+          <div class="lbl">Conversations</div>
+          <div class="val" id="ov-chats">—</div>
+          <div class="sub">chat turns processed this session</div>
+        </div>
+        <div class="card stat">
+          <div class="accent" style="background:var(--violet)"></div>
+          <div class="lbl">Controller decisions</div>
+          <div class="val" id="ov-decisions">—</div>
+          <div class="sub" id="ov-decisions-sub">ADD · UPDATE · DELETE · NOOP</div>
+        </div>
+        <div class="card stat">
+          <div class="accent" style="background:var(--amber)"></div>
+          <div class="lbl">Memories retrieved</div>
+          <div class="val" id="ov-retrieved">—</div>
+          <div class="sub" id="ov-retrieved-sub">passed into answer prompts</div>
         </div>
       </div>
-      <div id="mem-list"></div>
-    </div>
 
-    <!-- Decisions tab -->
-    <div id="tab-decisions" class="tab-content">
-      <div id="decisions-list"><div class="empty-state">Send a message to see controller decisions.</div></div>
-    </div>
-
-    <!-- Timeline tab -->
-    <div id="tab-timeline" class="tab-content">
-      <div id="timeline-list"><div class="empty-state">No memory events yet.</div></div>
-    </div>
-
-    <!-- Capacity tab -->
-    <div id="tab-capacity" class="tab-content">
-      <div style="font-size:13px;color:var(--muted);margin-bottom:12px">
-        Tier capacities. STM overflows to MTM; MTM overflows to LTM.
+      <div class="grid g3 section">
+        <div class="card">
+          <h3>Tier distribution (STM → MTM → LTM)</h3>
+          <div id="ov-tiers">
+            <div class="tierbar"><div class="lab"><span>STM · short-term</span><b>—</b></div>
+              <div class="bar"><i class="fill-stm" style="width:0%"></i></div></div>
+            <div class="tierbar"><div class="lab"><span>MTM · mid-term</span><b>—</b></div>
+              <div class="bar"><i class="fill-mtm" style="width:0%"></i></div></div>
+            <div class="tierbar"><div class="lab"><span>LTM · long-term</span><b>—</b></div>
+              <div class="bar"><i class="fill-ltm" style="width:0%"></i></div></div>
+          </div>
+          <div class="legend">
+            <span><i style="background:var(--cyan)"></i>STM overflows to MTM at <span class="mono" id="ov-stm-cap">—</span></span>
+            <span><i style="background:var(--violet)"></i>MTM overflows to LTM at <span class="mono" id="ov-mtm-cap">—</span></span>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Controller decisions by action</h3>
+          <div class="mchart" id="ov-decisions-chart"></div>
+          <div class="hint" style="margin-top:6px">Counted from live chat turns (extraction → scoring → policy).</div>
+        </div>
+        <div class="card">
+          <h3>System health</h3>
+          <div class="grid" style="gap:9px">
+            <div class="row" style="display:flex;justify-content:space-between;font-size:12.5px">
+              <span style="color:var(--muted)">API</span><b id="ov-health-api">—</b></div>
+            <div class="row" style="display:flex;justify-content:space-between;font-size:12.5px">
+              <span style="color:var(--muted)">Provider / model</span><b id="ov-health-llm" class="mono" style="font-size:11.5px">—</b></div>
+            <div class="row" style="display:flex;justify-content:space-between;font-size:12.5px">
+              <span style="color:var(--muted)">Avg chat latency</span><b id="ov-latency" class="mono">—</b></div>
+            <div class="row" style="display:flex;justify-content:space-between;font-size:12.5px">
+              <span style="color:var(--muted)">LLM tokens used</span><b id="ov-tokens" class="mono">—</b></div>
+            <div class="row" style="display:flex;justify-content:space-between;font-size:12.5px">
+              <span style="color:var(--muted)">LLM calls</span><b id="ov-calls" class="mono">—</b></div>
+            <div class="row" style="display:flex;justify-content:space-between;font-size:12.5px">
+              <span style="color:var(--muted)">Server started</span><b id="ov-started" class="mono" style="font-size:11px">—</b></div>
+          </div>
+        </div>
       </div>
-      <div id="capacity-content"></div>
-    </div>
-  </div>
+
+      <div class="grid g2 section">
+        <div class="card">
+          <h3>Recent controller activity</h3>
+          <div class="eventlist" id="ov-recent"><div class="empty">No memory events yet — send a chat message.</div></div>
+        </div>
+        <div class="card">
+          <h3>Benchmark datasets & recent experiments</h3>
+          <div id="ov-datasets" style="margin-bottom:12px"></div>
+          <div id="ov-exp"><div class="empty">No experiments exported yet.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════════ AI CHAT ════════ -->
+    <section id="view-chat" class="view">
+      <div id="chat-wrap">
+        <div class="card" id="chat-panel" style="padding:0">
+          <div id="chat-messages"></div>
+          <div id="chat-input-row">
+            <input class="inp" id="chat-session" value="web" style="width:90px" title="session id">
+            <textarea id="chat-input" rows="1"
+              placeholder="Chat with MemAge…  e.g. “I live in Bengaluru.” then “Where do I live?”"
+              onkeydown="chatKey(event)"></textarea>
+            <button id="chat-send" onclick="sendChat()">Send</button>
+          </div>
+        </div>
+        <div id="chat-side">
+          <div class="card">
+            <h3>Last request</h3>
+            <div class="grid" style="gap:8px;font-size:12.5px">
+              <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Latency</span><b class="mono" id="cs-latency">—</b></div>
+              <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Prompt tokens</span><b class="mono" id="cs-ptok">—</b></div>
+              <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Completion tokens</span><b class="mono" id="cs-ctok">—</b></div>
+              <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">LLM calls</span><b class="mono" id="cs-calls">—</b></div>
+              <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Memories retrieved</span><b class="mono" id="cs-ids">—</b></div>
+            </div>
+            <div class="hint" style="margin-top:9px">Token counts are real provider usage (Groq API), not estimates.</div>
+          </div>
+          <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column">
+            <h3>Retrieved context (last turn)</h3>
+            <pre class="mono" id="cs-context"
+              style="font-size:11px;color:var(--muted);background:var(--bg);border:1px solid var(--border);
+                     border-radius:8px;padding:9px;overflow:auto;white-space:pre-wrap;max-height:260px">
+(ask something to see the memory context)</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════════ MEMORY ARCHITECTURE ════════ -->
+    <section id="view-memory" class="view">
+      <div class="badges">
+        <span class="badge b-teal">TIERED STORAGE</span>
+        <span class="badge b-grey">STM capacity-bounded → cascade overflow → MTM → LTM</span>
+        <span class="badge b-violet">Access-count promotion: MTM → LTM</span>
+      </div>
+
+      <div class="tierflow">
+        <div class="tierbox">
+          <h4><span class="dot" style="background:var(--cyan)"></span> STM · Short-term</h4>
+          <div class="cap">newest interactions · capacity <span class="mono" id="mem-stm-cap">—</span></div>
+          <div class="bar"><i class="fill-stm" id="mem-stm-bar" style="width:0%"></i></div>
+          <div style="margin-top:7px;font-size:12px;color:var(--muted)"><b class="mono" id="mem-stm-n">0</b> memories</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="tierbox">
+          <h4><span class="dot" style="background:var(--violet)"></span> MTM · Mid-term</h4>
+          <div class="cap">overflow from STM · capacity <span class="mono" id="mem-mtm-cap">—</span></div>
+          <div class="bar"><i class="fill-mtm" id="mem-mtm-bar" style="width:0%"></i></div>
+          <div style="margin-top:7px;font-size:12px;color:var(--muted)"><b class="mono" id="mem-mtm-n">0</b> memories</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="tierbox">
+          <h4><span class="dot" style="background:var(--teal)"></span> LTM · Long-term</h4>
+          <div class="cap">promoted by repeated access · unbounded</div>
+          <div class="bar"><i class="fill-ltm" style="width:100%;opacity:.35"></i></div>
+          <div style="margin-top:7px;font-size:12px;color:var(--muted)"><b class="mono" id="mem-ltm-n">0</b> memories</div>
+        </div>
+      </div>
+
+      <div class="card section" style="margin-top:14px">
+        <h3>Controller decisions (this session)</h3>
+        <div class="grid g4" id="mem-decisions" style="gap:10px"></div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:13px">
+          <h3 style="margin:0">Stored memories</h3>
+          <input class="inp" id="mem-search" placeholder="Filter text…"
+                 style="flex:1;min-width:180px" oninput="loadMemories()">
+          <span class="hint" id="mem-count"></span>
+        </div>
+        <div class="memcols">
+          <div class="memcol"><div class="colhead"><span>STM</span><span id="col-n-stm" class="mono">0</span></div><div id="col-STM"></div></div>
+          <div class="memcol"><div class="colhead"><span>MTM</span><span id="col-n-mtm" class="mono">0</span></div><div id="col-MTM"></div></div>
+          <div class="memcol"><div class="colhead"><span>LTM</span><span id="col-n-ltm" class="mono">0</span></div><div id="col-LTM"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════════ PIPELINE MONITOR ════════ -->
+    <section id="view-pipeline" class="view">
+      <div class="card section">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+          <h3 style="margin:0">Architecture · interaction → response</h3>
+          <span class="badge b-grey">STATIC ARCHITECTURE — these are the pipeline stages, not live events</span>
+        </div>
+        <div class="pipe" style="margin-top:13px">
+          <div class="stage"><div class="num">01</div><div class="nm">Interaction stream</div><div class="ds">User message + session id enters the agent</div><span class="edge">→</span></div>
+          <div class="stage"><div class="num">02</div><div class="nm">Fact extraction</div><div class="ds">LLM turns the turn into candidate facts</div><span class="edge">→</span></div>
+          <div class="stage"><div class="num">03</div><div class="nm">Candidate memory</div><div class="ds">Typed items with ids, timestamps, source</div><span class="edge">→</span></div>
+          <div class="stage"><div class="num">04</div><div class="nm">Selective controller</div><div class="ds">Scores importance, temporal, contradiction, pressure</div><span class="edge">→</span></div>
+          <div class="stage"><div class="num">05</div><div class="nm">ADD / UPDATE / DELETE / NOOP</div><div class="ds">Joint policy chooses a write action per candidate</div><span class="edge">→</span></div>
+          <div class="stage"><div class="num">06</div><div class="nm">Tiered memory store</div><div class="ds">STM → MTM → LTM with rebalancing</div><span class="edge">→</span></div>
+          <div class="stage"><div class="num">07</div><div class="nm">Two-stage retrieval</div><div class="ds">Coarse embedding retrieval shortlists k candidates</div><span class="edge">→</span></div>
+          <div class="stage"><div class="num">08</div><div class="nm">Reranking</div><div class="ds">LLM reranks the shortlist against the query</div><span class="edge">→</span></div>
+          <div class="stage"><div class="num">09</div><div class="nm">Token budget</div><div class="ds">Select memories until the budget is exhausted</div><span class="edge">→</span></div>
+          <div class="stage"><div class="num">10</div><div class="nm">Agent response</div><div class="ds">Grounded answer + latency + real token usage</div><span class="edge">→</span></div>
+        </div>
+      </div>
+
+      <div class="grid g2">
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+            <h3 style="margin:0">Live engine events</h3>
+            <span class="badge b-teal">ACTUAL DATA · from /api/timeline</span>
+          </div>
+          <div class="eventlist" id="pl-events"><div class="empty">No ingestion events yet — send a chat message.</div></div>
+        </div>
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+            <h3 style="margin:0">Last turn · stage by stage</h3>
+            <span class="badge b-cyan">ACTUAL DATA · from /api/chat</span>
+          </div>
+          <div id="pl-turn"><div class="empty">No turn analysed yet.</div></div>
+        </div>
+      </div>
+
+      <div class="card section" style="margin-top:13px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+          <h3 style="margin:0">Retrieval trace · last query</h3>
+          <span class="badge b-cyan">ACTUAL DATA · coarse rank → rerank score → token budget</span>
+        </div>
+        <div id="pl-retrieval"><div class="empty">No retrieval yet.</div></div>
+      </div>
+    </section>
+
+    <!-- ════════ EVALUATION ════════ -->
+    <section id="view-evaluation" class="view">
+      <div class="tabs" id="eval-tabs">
+        <button class="tab active" data-ds="locomo">LoCoMo</button>
+        <button class="tab" data-ds="longmemeval">LongMemEval</button>
+        <button class="tab" data-ds="synthetic">Synthetic (offline)</button>
+      </div>
+
+      <div class="card section">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+          <h3 style="margin:0">Baseline comparison — <span id="eval-ds-name">locomo</span></h3>
+          <span class="hint">Scores read from exported JSON in <span class="mono">results/</span> — never computed in the browser</span>
+        </div>
+        <div id="eval-experiments"><div class="empty">Loading…</div></div>
+        <div style="margin-top:15px">
+          <h3 style="margin-bottom:9px">Strategy coverage</h3>
+          <table class="tbl" id="eval-coverage"></table>
+        </div>
+      </div>
+
+      <div class="card section">
+        <h3>F1 by strategy (executed artifacts only)</h3>
+        <div class="mchart" id="eval-f1chart"><div class="empty">No results for this dataset yet.</div></div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:11px">
+          <h3 style="margin:0">Run a comparison</h3>
+          <span class="badge b-amber">RUNS ONLY WHEN YOU CLICK · single job at a time (quota-safe)</span>
+        </div>
+        <div class="ctrls" style="margin-bottom:10px">
+          <div class="checks" id="eval-strategies"></div>
+        </div>
+        <div class="ctrls">
+          <label class="hint">sample n=
+            <select class="inp" id="eval-sample">
+              <option value="1">1</option><option value="2" selected>2</option>
+              <option value="3">3</option><option value="5">5</option><option value="10">10</option>
+            </select>
+          </label>
+          <button class="btn primary" id="eval-run-btn" onclick="runComparison()">▶ Run comparison</button>
+          <span class="hint">Artifacts export to <span class="mono">results/<dataset>_compare_*.json/.csv</span></span>
+        </div>
+        <div style="margin-top:13px" id="eval-jobs"><div class="empty">No jobs this session.</div></div>
+      </div>
+    </section>
+
+    <!-- ════════ ABLATION STUDIES ════════ -->
+    <section id="view-ablation" class="view">
+      <div class="badges">
+        <span class="badge b-violet">ONE FACTOR VARIED PER RUN</span>
+        <span class="hint">Experiments never start automatically — press Run. Results export to <span class="mono">results/</span> and appear below.</span>
+      </div>
+
+      <div class="ctrls section" style="margin-top:6px">
+        <label class="hint">Dataset
+          <select class="inp" id="abl-ds">
+            <option value="locomo" selected>LoCoMo</option>
+            <option value="longmemeval">LongMemEval</option>
+            <option value="synthetic">Synthetic (offline)</option>
+          </select>
+        </label>
+        <label class="hint">sample n=
+          <select class="inp" id="abl-sample">
+            <option value="1">1</option><option value="2" selected>2</option>
+            <option value="3">3</option><option value="5">5</option>
+          </select>
+        </label>
+        <button class="btn danger" onclick="confirmClearArtifacts()" title="move experiment JSON/CSV out of results/">🗑 Clear artifacts</button>
+      </div>
+
+      <div class="grid g2">
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
+            <h3 style="margin:0">Retrieval stage</h3>
+            <button class="btn primary btn-run" data-abl="stage" onclick="runAblation('stage')">▶ Run</button>
+          </div>
+          <div class="hint" style="margin:7px 0 11px">coarse-only (bypass LLM reranker) vs full two-stage pipeline.</div>
+          <div id="abl-result-stage" class="abl-result"><div class="empty">Not executed for the selected dataset.</div></div>
+        </div>
+
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
+            <h3 style="margin:0">Stage-1 k sweep</h3>
+            <button class="btn primary btn-run" data-abl="k" onclick="runAblation('k')">▶ Run</button>
+          </div>
+          <div class="hint" style="margin:7px 0 9px">Candidate shortlist size handed to the reranker.</div>
+          <div class="ctrls" style="margin-bottom:11px">
+            <input class="inp" id="abl-k-values" value="1,3,5" style="width:140px" title="comma-separated k values">
+            <span class="hint">comma-separated values</span>
+          </div>
+          <div id="abl-result-k" class="abl-result"><div class="empty">Not executed for the selected dataset.</div></div>
+        </div>
+
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
+            <h3 style="margin:0">Token budget sweep</h3>
+            <button class="btn primary btn-run" data-abl="budget" onclick="runAblation('budget')">▶ Run</button>
+          </div>
+          <div class="hint" style="margin:7px 0 9px">Context token budget for memory selection.</div>
+          <div class="ctrls" style="margin-bottom:11px">
+            <input class="inp" id="abl-budget-values" value="128,512" style="width:140px" title="comma-separated budgets">
+            <span class="hint">comma-separated values</span>
+          </div>
+          <div id="abl-result-budget" class="abl-result"><div class="empty">Not executed for the selected dataset.</div></div>
+        </div>
+
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
+            <h3 style="margin:0">Controller signal</h3>
+            <button class="btn primary btn-run" data-abl="signal" onclick="runAblation('signal')">▶ Run</button>
+          </div>
+          <div class="hint" style="margin:7px 0 9px">Varies one controller threshold — genuinely gates what gets stored (ADD/UPDATE/DELETE/NOOP).</div>
+          <div class="ctrls" style="margin-bottom:11px">
+            <select class="inp" id="abl-signal">
+              <option value="importance">importance</option>
+              <option value="temporal">temporal</option>
+              <option value="contradiction">contradiction</option>
+              <option value="storage">storage</option>
+            </select>
+          </div>
+          <div id="abl-result-signal" class="abl-result"><div class="empty">Not executed for the selected dataset.</div></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:13px">
+        <h3>Run log</h3>
+        <div id="abl-jobs"><div class="empty">No jobs this session.</div></div>
+      </div>
+    </section>
+  </main>
 </div>
 
 <!-- Reset modal -->
 <div id="modal-overlay">
   <div id="modal">
     <h2>⚠ Reset all memories?</h2>
-    <p>This permanently deletes every stored memory across all tiers and clears the event timeline. This cannot be undone.</p>
+    <p>Deletes every stored memory across STM / MTM / LTM and clears the event timeline. This cannot be undone.</p>
     <div id="modal-actions">
-      <button class="btn" onclick="hideModal()">Cancel</button>
+      <button class="btn" onclick="hideReset()">Cancel</button>
       <button class="btn danger" onclick="doReset()">Delete all</button>
     </div>
   </div>
 </div>
 
 <script>
-const API = '';  // same origin
-let currentTier = 'all';
-let lastDecisions = [];
+'use strict';
+const API = '';
+let lastTurn = null;          // last AgentResponse turn_result (pipeline view)
+let lastRetrieval = null;     // last retrieval trace
+let health = null;
+let experiments = [];
+let jobs = [];
+let jobPoll = null;
+let evalDs = 'locomo';
 
-// ── Health ──────────────────────────────────────────────────────────────────
-async function checkHealth() {
-  try {
-    const r = await fetch(`${API}/api/health`);
-    if (!r.ok) throw new Error(r.status);
-    const d = await r.json();
-    const dot = document.getElementById('health-dot');
-    dot.className = 'ok';
-    const total = Object.values(d.counts).reduce((a,b) => a+b, 0);
-    const modeTag = d.is_demo ? ' · <span style="color:var(--yellow);font-weight:600">DEMO</span>' : '';
-    document.getElementById('health-info').innerHTML =
-      `${esc(d.provider || 'unknown')}${modeTag} · ${total} memories`;
-    updateCapacity(d.counts, d.stm_capacity, d.mtm_capacity);
-  } catch(e) {
-    document.getElementById('health-dot').className = 'err';
-    document.getElementById('health-info').textContent = 'server unreachable';
-  }
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+const fmt = (v, d=3) => (v === null || v === undefined) ? '—' : Number(v).toFixed(d);
+const num = v => (v === null || v === undefined) ? '—' : Number(v).toLocaleString();
+
+function toast(msg, ok) {
+  const t = $('toast');
+  t.textContent = msg; t.className = ok ? 'ok' : '';
+  t.style.display = 'block';
+  clearTimeout(t._t); t._t = setTimeout(() => t.style.display = 'none', ok ? 2800 : 6000);
 }
 
-// ── Memories ────────────────────────────────────────────────────────────────
-async function refreshMemories() {
-  const q = document.getElementById('mem-search').value.trim();
-  const params = new URLSearchParams();
-  if (currentTier !== 'all') params.set('tier', currentTier);
-  if (q) params.set('q', q);
-  try {
-    const r = await fetch(`${API}/api/memories?${params}`);
-    const d = await r.json();
-    renderMemories(d.items || []);
-  } catch(e) { showError('Could not load memories: ' + e.message); }
+async function api(path, opts) {
+  const r = await fetch(API + path, opts);
+  let data = null;
+  try { data = await r.json(); } catch (e) { data = {error: 'invalid JSON from server'}; }
+  return {ok: r.ok, status: r.status, data};
 }
 
-function setTier(tier, btn) {
-  currentTier = tier;
-  document.querySelectorAll('.tier-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  refreshMemories();
+/* ── Navigation ───────────────────────────────────── */
+const TITLES = {
+  overview: ['Overview', 'Live system state — every number comes from the backend'],
+  chat: ['AI Chat', 'Grounded answers · retrieved memory · real latency and token usage'],
+  memory: ['Memory Architecture', 'STM → MTM → LTM: stored memories, tiers and controller decisions'],
+  pipeline: ['Pipeline Monitor', 'Architecture (static) beside live execution events (actual)'],
+  evaluation: ['Evaluation', 'Baseline comparison on LoCoMo & LongMemEval — exported artifacts only'],
+  ablation: ['Ablation Studies', 'Stage · k · token budget · controller signals — run on demand'],
+};
+document.querySelectorAll('.nav-btn').forEach(b => b.addEventListener('click', () => showView(b.dataset.view)));
+function showView(name) {
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
+  const [t, s] = TITLES[name] || ['', ''];
+  $('view-title').textContent = t; $('view-sub').textContent = s;
+  if (name === 'overview') loadOverview();
+  if (name === 'memory') loadMemories();
+  if (name === 'pipeline') loadPipeline();
+  if (name === 'evaluation') loadEvaluation();
+  if (name === 'ablation') loadAblation();
 }
 
-function renderMemories(items) {
-  const el = document.getElementById('mem-list');
-  if (!items.length) {
-    el.innerHTML = '<div class="empty-state">No memories found.</div>'; return;
-  }
-  el.innerHTML = items.map(m => `
-    <div class="mem-card" onclick="showMemory('${esc(m.id)}')">
-      <div class="mem-text">${esc(m.text)}</div>
-      <div class="mem-meta">
-        <span class="tier-badge tier-${m.tier || 'STM'}">${m.tier || 'STM'}</span>
-        <span>${esc(m.source || '')}</span>
-        <span>${esc((m.timestamp||'').substring(0,16).replace('T',' '))}</span>
-        <span>accessed ${m.access_count||0}×</span>
-        <span class="mem-delete" style="margin-left:auto;color:var(--red);cursor:pointer"
-              onclick="event.stopPropagation();deleteMemory('${esc(m.id)}')">✕</span>
-      </div>
-    </div>`).join('');
+function refreshAll() {
+  loadHealth();
+  showView(document.querySelector('.nav-btn.active').dataset.view);
+  toast('Refreshed', true);
 }
 
-async function deleteMemory(id) {
-  if (!confirm(`Delete memory "${id}"?`)) return;
-  await fetch(`${API}/api/memories/${encodeURIComponent(id)}`, {method:'DELETE'});
-  refreshMemories();
-  checkHealth();
+/* ── Health ───────────────────────────────────────── */
+async function loadHealth() {
+  const {ok, data} = await api('/api/health');
+  const dot = $('sys-dot');
+  if (!ok) { dot.className = 'dot err'; $('sys-provider').textContent = 'offline'; return; }
+  health = data;
+  dot.className = 'dot ok';
+  $('sys-provider').textContent = data.provider + (data.is_demo ? ' (demo)' : '');
+  $('sys-model').textContent = data.model || '—';
+  $('sys-budget').textContent = data.agent?.token_budget ?? '—';
+  $('sys-k').textContent = data.agent?.k ?? '—';
+  $('sys-store').textContent = data.total + ' memories';
 }
 
-async function showMemory(id) {
-  const r = await fetch(`${API}/api/memories/${encodeURIComponent(id)}`);
-  if (!r.ok) return;
-  const m = await r.json();
-  alert(`ID: ${m.id}\nTier: ${m.tier}\nSource: ${m.source}\nTimestamp: ${m.timestamp}\nAccess count: ${m.access_count}\n\n${m.text}`);
-}
+/* ── Overview ─────────────────────────────────────── */
+async function loadOverview() {
+  await loadHealth();
+  const {ok: hok, data: h} = await api('/api/health');
+  const {data: tl} = await api('/api/timeline');
+  const {data: bm} = await api('/api/benchmarks');
+  experiments = bm.experiments || []; jobs = bm.jobs || [];
 
-// ── Chat ────────────────────────────────────────────────────────────────────
-function onKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-}
+  if (hok) {
+    const c = h.counts || {};
+    $('ov-total').textContent = num(h.total);
+    $('ov-total-sub').textContent = `STM ${c.STM ?? 0} · MTM ${c.MTM ?? 0} · LTM ${c.LTM ?? 0}`;
+    $('ov-chats').textContent = num(h.stats.chats);
+    const d = h.stats.decisions || {};
+    const dsum = (d.ADD||0)+(d.UPDATE||0)+(d.DELETE||0)+(d.NOOP||0);
+    $('ov-decisions').textContent = num(dsum);
+    $('ov-decisions-sub').textContent = `ADD ${d.ADD||0} · UPDATE ${d.UPDATE||0} · DELETE ${d.DELETE||0} · NOOP ${d.NOOP||0}`;
+    $('ov-retrieved').textContent = num(h.stats.retrieved_memories);
+    $('ov-retrieved-sub').textContent = `across ${h.stats.chats} chat turn(s)`;
+    $('ov-health-api').innerHTML = '<span class="badge b-teal">HEALTHY</span>';
+    $('ov-health-llm').textContent = h.provider + ' · ' + h.model;
+    $('ov-latency').textContent = h.stats.avg_latency_ms ? (h.stats.avg_latency_ms + ' ms') : '—';
+    $('ov-tokens').textContent = num(h.stats.tokens_total);
+    $('ov-calls').textContent = num(h.stats.llm_calls);
+    $('ov-started').textContent = (h.stats.started || '').replace('T', ' ').substring(0, 19) + ' UTC';
 
-async function sendMessage() {
-  const input = document.getElementById('chat-input');
-  const msg = input.value.trim();
-  if (!msg) return;
-  const session = document.getElementById('session-input').value.trim() || 'web';
-  input.value = '';
-  input.style.height = '';
-
-  addMessage(msg, 'user');
-  const typing = addMessage('…', 'agent typing');
-  document.getElementById('send-btn').disabled = true;
-
-  try {
-    const r = await fetch(`${API}/api/chat`, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({message: msg, session_id: session}),
+    // tier bars
+    const caps = {STM: h.stm_capacity, MTM: h.mtm_capacity, LTM: null};
+    const bars = $('ov-tiers').querySelectorAll('.tierbar');
+    ['STM','MTM','LTM'].forEach((tier, i) => {
+      const n = c[tier] || 0, cap = caps[tier];
+      const bar = bars[i]; bar.querySelector('b').textContent = cap ? `${n} / ${cap}` : String(n);
+      const fill = bar.querySelector('i');
+      fill.style.width = cap ? Math.min(100, Math.round(n / cap * 100)) + '%' : (n ? '100%' : '0%');
     });
-    const d = await r.json();
-    typing.remove();
-    if (!r.ok) { addMessage('Error: ' + (d.error || r.status), 'agent'); return; }
+    $('ov-stm-cap').textContent = h.stm_capacity;
+    $('ov-mtm-cap').textContent = h.mtm_capacity;
 
-    const answerEl = addMessage(d.answer || '(no answer)', 'agent');
-    if (d.retrieved_ids && d.retrieved_ids.length) {
-      const refs = document.createElement('div');
-      refs.className = 'refs';
-      refs.innerHTML = 'Retrieved: ' + d.retrieved_ids.map(id =>
-        `<span onclick="showMemory('${esc(id)}')">${esc(id)}</span>`).join('');
-      answerEl.appendChild(refs);
-    }
-    if (d.turn_result) renderDecisions(d.turn_result);
-    refreshMemories();
-    checkHealth();
-    refreshTimeline();
-  } catch(e) {
-    typing.remove();
-    addMessage('Network error: ' + e.message, 'agent');
-  } finally {
-    document.getElementById('send-btn').disabled = false;
+    // decisions chart
+    const maxD = Math.max(1, d.ADD||0, d.UPDATE||0, d.DELETE||0, d.NOOP||0);
+    $('ov-decisions-chart').innerHTML = ['ADD','UPDATE','DELETE','NOOP'].map(a => `
+      <div class="mrow"><div class="mname">${a}</div>
+        <div class="mtrack"><div class="mfill" style="width:${Math.round((d[a]||0)/maxD*100)}%;
+          background:${a==='ADD'?'rgba(52,211,153,.8)':a==='UPDATE'?'rgba(251,191,36,.8)':a==='DELETE'?'rgba(248,113,113,.8)':'rgba(141,150,165,.55)'}"></div></div>
+        <div class="mval">${d[a]||0}</div></div>`).join('');
   }
+
+  // recent events
+  const ev = (tl && tl.events) || [];
+  $('ov-recent').innerHTML = ev.length ? ev.slice(-6).reverse().map(evtHtml).join('')
+    : '<div class="empty">No memory events yet — send a chat message.</div>';
+
+  // datasets
+  const ds = h.datasets || {};
+  $('ov-datasets').innerHTML = ['locomo','longmemeval','synthetic'].map(k =>
+    `<span class="badge ${ds[k] ? 'b-teal' : 'b-red'}" style="margin-right:7px">${k.toUpperCase()} · ${ds[k] ? 'ready' : 'missing file'}</span>`).join('');
+
+  // recent experiments
+  const recent = [...experiments].sort((a,b) => (b.modified || '').localeCompare(a.modified || '')).slice(0, 4);
+  $('ov-exp').innerHTML = recent.length ? recent.map(e =>
+    `<div class="job"><div class="jhead">
+      <span class="badge ${e.type === 'ablation' ? 'b-violet' : 'b-cyan'}">${(e.type || '').toUpperCase()}</span>
+      <span class="jname">${esc(e.file)}</span>
+      <span class="hint">${esc(e.dataset_name || '')} · ${e.num_cases} case(s) · k=${e.k}</span></div></div>`).join('')
+    : '<div class="empty">No experiments exported yet — run one from Evaluation / Ablation.</div>';
 }
 
-function addMessage(text, cls) {
-  const msgs = document.getElementById('messages');
+function evtHtml(e) {
+  const scores = e.scores || {};
+  const skeys = ['importance','temporal_validity','contradiction','storage_pressure'];
+  return `<div class="event">
+    <div class="act act-${esc(e.action)}">${esc(e.action)}</div>
+    <div>
+      <div>${esc(e.candidate_text || e.candidate_id || '')}</div>
+      ${e.target_id ? `<div class="hint" style="margin-top:3px">→ target <span class="mono">${esc(e.target_id)}</span></div>` : ''}
+      ${e.action !== 'DELETE' ? skeys.map(k => {
+        const v = Number(scores[k] || 0);
+        return `<div class="scorerow"><span class="sl">${k.replace(/_/g,' ')}</span>
+          <span class="sb"><span class="sf" style="width:${Math.round(v*100)}%"></span></span>
+          <span class="sv">${v.toFixed(3)}</span></div>`; }).join('') : ''}
+    </div>
+    <div class="ts">${esc((e.ts || '').substring(11, 19))}</div>
+  </div>`;
+}
+
+/* ── Chat ─────────────────────────────────────────── */
+function chatKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); } }
+
+function addMsg(cls, html) {
+  const box = $('chat-messages');
   const el = document.createElement('div');
-  el.className = `msg ${cls}`;
-  el.textContent = text;
-  msgs.appendChild(el);
-  msgs.scrollTop = msgs.scrollHeight;
+  el.className = 'msg ' + cls;
+  if (cls === 'user' || cls === 'agent') el.textContent = html; else el.innerHTML = html;
+  box.appendChild(el); box.scrollTop = box.scrollHeight;
   return el;
 }
 
-// ── Decisions ───────────────────────────────────────────────────────────────
-function renderDecisions(turnResult) {
-  const el = document.getElementById('decisions-list');
-  if (!turnResult.candidates || !turnResult.candidates.length) {
-    el.innerHTML = '<div class="empty-state">No candidates extracted.</div>'; return;
+async function sendChat() {
+  const input = $('chat-input');
+  const message = input.value.trim();
+  if (!message) return;
+  const session_id = $('chat-session').value.trim() || 'web';
+  input.value = '';
+  addMsg('user', message);
+
+  const typing = document.createElement('div');
+  typing.className = 'msg agent';
+  typing.innerHTML = '<span class="spin"></span> <span style="color:var(--muted);font-size:12.5px">retrieving · reranking · answering…</span>';
+  const box = $('chat-messages');
+  box.appendChild(typing); box.scrollTop = box.scrollHeight;
+  $('chat-send').disabled = true;
+
+  const {ok, status, data} = await api('/api/chat', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({message, session_id}),
+  });
+  typing.remove();
+  $('chat-send').disabled = false;
+
+  if (!ok) {
+    addMsg('agent', '⚠ Error ' + status + ': ' + (data.error || 'request failed'));
+    toast('Chat failed: ' + (data.error || status));
+    return;
   }
-  el.innerHTML = turnResult.candidates.map(c => {
-    const d = c.decision;
-    const scores = d.scores || {};
-    const scoreNames = ['importance','temporal_validity','contradiction','storage_pressure'];
-    return `<div class="decision-card">
-      <div class="action action-${d.action}">${d.action}${d.target_id ? ` → ${esc(d.target_id)}` : ''}</div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${esc(c.text || '')}</div>
-      ${scoreNames.map(k => {
-        const v = (scores[k] || 0).toFixed(3);
-        const pct = Math.round((scores[k]||0)*100);
-        return `<div class="score-row">
-          <div class="score-label">${k.replace(/_/g,' ')}</div>
-          <div class="score-bar"><div class="score-fill" style="width:${pct}%"></div></div>
-          <div class="score-val">${v}</div>
-        </div>`;
-      }).join('')}
-      ${!c.ok ? `<div style="font-size:11px;color:var(--red);margin-top:6px">Error: ${esc(c.error||'')}</div>` : ''}
-    </div>`;
-  }).join('');
+
+  // ── sidebar stats
+  const u = data.usage || {};
+  $('cs-latency').textContent = (data.latency_ms ?? '—') + ' ms';
+  $('cs-ptok').textContent = u.calls ? num(u.prompt_tokens) : 'n/a';
+  $('cs-ctok').textContent = u.calls ? num(u.completion_tokens) : 'n/a';
+  $('cs-calls').textContent = u.calls ?? '—';
+  $('cs-ids').textContent = (data.retrieved_ids || []).length;
+  $('cs-context').textContent = data.context || '(empty — no relevant memories for this query)';
+
+  // ── pipeline monitor state
+  lastTurn = data.turn_result;
+  lastRetrieval = data.retrieval_trace || [];
+  renderPipeTurn(); renderPipeRetrieval();
+
+  // ── agent message
+  const el = addMsg('agent', data.answer || '(no answer)');
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  meta.innerHTML =
+    `<span class="chip">${(data.latency_ms ?? '—')} ms</span>` +
+    (u.calls ? `<span class="chip">${num(u.prompt_tokens + u.completion_tokens)} tok (${u.calls} calls)</span>` : '') +
+    `<span class="chip">${(data.retrieved_ids || []).length} memory(ies)</span>` +
+    `<span class="chip">${esc(session_id)}</span>`;
+  el.appendChild(meta);
+
+  const trace = data.retrieval_trace || [];
+  if (trace.length) {
+    const refs = document.createElement('div');
+    refs.className = 'refs';
+    refs.innerHTML = '<div style="font-size:10.5px;color:var(--dim);letter-spacing:.5px">RETRIEVED MEMORIES</div>' +
+      trace.map(t => `<span class="refbtn" onclick="showMemory('${esc(t.id)}')" title="${esc(t.text)}">${esc(t.id)} · ${t.score !== null && t.score !== undefined ? Number(t.score).toFixed(3) : '—'}</span>`).join('');
+    el.appendChild(refs);
+
+    const det = document.createElement('details');
+    det.innerHTML = '<summary>retrieval trace (stage-1 rank → rerank score → budget)</summary>' +
+      `<table class="trace-tbl"><tr><th>#</th><th>id</th><th>tier</th><th>s1 rank</th><th>score</th></tr>` +
+      trace.map((t, i) => `<tr><td>${i+1}</td><td>${esc(t.id)}</td><td>${esc(t.tier || '—')}</td>
+        <td>${t.stage1_rank ?? '—'}</td><td>${t.score !== null && t.score !== undefined ? Number(t.score).toFixed(3) : '—'}</td></tr>`).join('') +
+      '</table>';
+    el.appendChild(det);
+  }
+  if (data.context) {
+    const det2 = document.createElement('details');
+    det2.innerHTML = '<summary>formatted context sent to the LLM</summary><pre>' + esc(data.context) + '</pre>';
+    el.appendChild(det2);
+  }
+  if (data.ok === false) {
+    const err = document.createElement('div');
+    err.style.cssText = 'margin-top:7px;font-size:11.5px;color:var(--red)';
+    err.textContent = 'provider error: ' + (data.error || 'unknown');
+    el.appendChild(err);
+  }
+
+  loadHealth();
+  renderPipelineEvents(); refreshJobs();
 }
 
-// ── Timeline ─────────────────────────────────────────────────────────────────
-async function refreshTimeline() {
-  try {
-    const r = await fetch(`${API}/api/timeline`);
-    const d = await r.json();
-    renderTimeline(d.events || []);
-  } catch(e) {}
+/* ── Memory architecture ──────────────────────────── */
+async function loadMemories() {
+  const [h, m] = await Promise.all([api('/api/health'), api('/api/memories')]);
+  if (h.ok) {
+    const c = h.data.counts, caps = {STM: h.data.stm_capacity, MTM: h.data.mtm_capacity};
+    $('mem-stm-cap').textContent = h.data.stm_capacity;
+    $('mem-mtm-cap').textContent = h.data.mtm_capacity;
+    $('mem-stm-n').textContent = c.STM; $('mem-mtm-n').textContent = c.MTM; $('mem-ltm-n').textContent = c.LTM;
+    $('mem-stm-bar').style.width = Math.min(100, c.STM / caps.STM * 100) + '%';
+    $('mem-mtm-bar').style.width = Math.min(100, c.MTM / caps.MTM * 100) + '%';
+    const d = h.data.stats.decisions;
+    $('mem-decisions').innerHTML = ['ADD','UPDATE','DELETE','NOOP'].map(a => `
+      <div class="card stat" style="padding:12px">
+        <div class="lbl" style="color:${a==='ADD'?'var(--green)':a==='UPDATE'?'var(--amber)':a==='DELETE'?'var(--red)':'var(--dim)'}">${a}</div>
+        <div class="val" style="font-size:21px">${d[a] ?? 0}</div>
+      </div>`).join('');
+  }
+  const q = ($('mem-search').value || '').trim();
+  const path = '/api/memories' + (q ? '?q=' + encodeURIComponent(q) : '');
+  const r = await api(path);
+  const items = (r.data && r.data.items) || [];
+  $('mem-count').textContent = items.length + ' shown';
+  const byTier = {STM: [], MTM: [], LTM: []};
+  items.forEach(i => (byTier[i.tier || 'STM'] || byTier.STM).push(i));
+  ['STM','MTM','LTM'].forEach(t => {
+    $('col-n-' + t.toLowerCase()).textContent = byTier[t].length;
+    $('col-' + t).innerHTML = byTier[t].length ? byTier[t].map(m => `
+      <div class="memcard" onclick="showMemory('${esc(m.id)}')">
+        <span class="del" onclick="event.stopPropagation();deleteMemory('${esc(m.id)}')" title="delete">✕</span>
+        <div class="t">${esc(m.text)}</div>
+        <div class="m">
+          <span>${esc(m.id)}</span>
+          <span>${esc((m.timestamp || '—').replace('T', ' ').substring(0, 16))}</span>
+          <span>accessed ${m.access_count ?? 0}×</span>
+          ${m.source ? `<span>src ${esc(m.source)}</span>` : ''}
+        </div>
+      </div>`).join('') : '<div class="empty">empty</div>';
+  });
 }
 
-function renderTimeline(events) {
-  const el = document.getElementById('timeline-list');
-  if (!events.length) { el.innerHTML = '<div class="empty-state">No memory events yet.</div>'; return; }
-  const colors = {ADD: 'var(--green)', UPDATE: 'var(--yellow)', DELETE: 'var(--red)', NOOP: 'var(--muted)'};
-  el.innerHTML = [...events].reverse().map(e => `
-    <div class="timeline-event">
-      <div class="tl-action" style="color:${colors[e.action]||'var(--muted)'}">${e.action}</div>
-      <div class="tl-text">${esc(e.candidate_text||e.candidate_id||'')}</div>
-      <div class="tl-ts">${esc((e.ts||'').substring(11,19))}</div>
-    </div>`).join('');
+async function deleteMemory(id) {
+  if (!confirm('Delete memory "' + id + '"?')) return;
+  const r = await api('/api/memories/' + encodeURIComponent(id), {method: 'DELETE'});
+  if (r.ok) { toast('Deleted ' + id, true); loadMemories(); loadHealth(); }
+  else toast('Delete failed: ' + (r.data.error || r.status));
 }
-
-// ── Capacity ─────────────────────────────────────────────────────────────────
-function updateCapacity(counts, stmCap, mtmCap) {
-  const el = document.getElementById('capacity-content');
-  const tiers = [
-    {name:'STM', count: counts.STM||0, cap: stmCap||20, desc:'Short-term memory'},
-    {name:'MTM', count: counts.MTM||0, cap: mtmCap||100, desc:'Mid-term memory'},
-    {name:'LTM', count: counts.LTM||0, cap: null, desc:'Long-term memory (unbounded)'},
-  ];
-  el.innerHTML = tiers.map(t => {
-    const pct = t.cap ? Math.min(100, Math.round(t.count/t.cap*100)) : 0;
-    const cls = pct >= 90 ? 'full' : pct >= 70 ? 'warn' : '';
-    return `<div class="cap-row" style="margin-bottom:14px">
-      <div class="cap-label">
-        <span><span class="tier-badge tier-${t.name}">${t.name}</span> ${t.desc}</span>
-        <span>${t.count}${t.cap ? ' / ' + t.cap : ''}</span>
-      </div>
-      ${t.cap ? `<div class="cap-bar"><div class="cap-fill ${cls}" style="width:${pct}%"></div></div>` : ''}
-    </div>`;
-  }).join('');
+async function showMemory(id) {
+  const r = await api('/api/memories/' + encodeURIComponent(id));
+  if (!r.ok) return toast('Memory not found: ' + id);
+  const m = r.data;
+  alert(`ID:      ${m.id}\nTier:    ${m.tier}\nSource:  ${m.source || '-'}\nTime:    ${m.timestamp || '-'}\nAccess:  ${m.access_count ?? 0}\nDistance:${m.distance ?? '-'}\n\n${m.text}`);
 }
-
-// ── Reset ────────────────────────────────────────────────────────────────────
-function showResetModal() { document.getElementById('modal-overlay').classList.add('visible'); }
-function hideModal() { document.getElementById('modal-overlay').classList.remove('visible'); }
+function showReset() { $('modal-overlay').classList.add('visible'); }
+function hideReset() { $('modal-overlay').classList.remove('visible'); }
 async function doReset() {
-  hideModal();
-  await fetch(`${API}/api/memories?confirm=true`, {method:'DELETE'});
-  document.getElementById('messages').innerHTML = '';
-  addMessage('All memories have been reset.', 'system');
-  refreshMemories();
-  checkHealth();
-  refreshTimeline();
+  hideReset();
+  const r = await api('/api/memories?confirm=true', {method: 'DELETE'});
+  if (r.ok) { toast('All memories reset', true); refreshAll(); }
+  else toast('Reset failed: ' + (r.data.error || r.status));
 }
 
-// ── Tabs ─────────────────────────────────────────────────────────────────────
-function switchTab(name, el) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-  el.classList.add('active');
-  document.getElementById('tab-' + name).classList.add('active');
-  if (name === 'timeline') refreshTimeline();
+/* ── Pipeline monitor ─────────────────────────────── */
+async function loadPipeline() {
+  const {data} = await api('/api/timeline');
+  pipelineEvents = (data && data.events) || [];
+  renderPipelineEvents();
+  renderPipeTurn(); renderPipeRetrieval();
+}
+let pipelineEvents = [];
+function renderPipelineEvents() {
+  const box = $('pl-events');
+  if (!pipelineEvents.length) return;
+  box.innerHTML = pipelineEvents.slice(-8).reverse().map(evtHtml).join('');
 }
 
-// ── Error banner ──────────────────────────────────────────────────────────────
-function showError(msg) {
-  const el = document.getElementById('error-banner');
-  el.textContent = msg;
-  el.style.display = 'block';
-  clearTimeout(el._t);
-  el._t = setTimeout(() => el.style.display = 'none', 5000);
+function renderPipeTurn() {
+  const box = $('pl-turn');
+  if (!lastTurn) return;
+  const cands = lastTurn.candidates || [];
+  if (!cands.length) {
+    box.innerHTML = '<div class="empty">No candidates extracted from this turn (small talk / question — correctly a NOOP for storage).</div>';
+    return;
+  }
+  box.innerHTML = cands.map(c => {
+    const d = c.decision || {}, s = d.scores || {};
+    const skeys = ['importance','temporal_validity','contradiction','storage_pressure'];
+    return `<div class="event" style="grid-template-columns:1fr auto">
+      <div>
+        <div><span class="badge ${d.action==='ADD'?'b-teal':d.action==='UPDATE'?'b-amber':d.action==='DELETE'?'b-red':'b-grey'}">${esc(d.action)}</span>
+          <b style="margin-left:7px">${esc(c.text || '')}</b></div>
+        ${skeys.map(k => { const v = Number(s[k] || 0);
+          return `<div class="scorerow"><span class="sl">${k.replace(/_/g,' ')}</span>
+            <span class="sb"><span class="sf" style="width:${Math.round(v*100)}%"></span></span>
+            <span class="sv">${v.toFixed(3)}</span></div>`; }).join('')}
+        ${!c.ok ? `<div style="font-size:11px;color:var(--red);margin-top:5px">error: ${esc(c.error || '')}</div>` : ''}
+      </div>
+      <div style="text-align:right;font-size:11px;color:var(--muted)">
+        <div>added ${lastTurn.added.length} · updated ${lastTurn.updated.length}</div>
+        <div>deleted ${lastTurn.deleted.length} · noop ${lastTurn.noops.length}</div>
+      </div>
+    </div>`;
+  }).join('');
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function renderPipeRetrieval() {
+  const box = $('pl-retrieval');
+  if (lastRetrieval === null) return;
+  if (!lastRetrieval.length) {
+    box.innerHTML = '<div class="empty">No memory survived retrieval + token budget for the last query (empty store or irrelevant memories).</div>';
+    return;
+  }
+  box.innerHTML = `<table class="tbl">
+    <tr><th>final</th><th>memory id</th><th>tier</th><th>stage-1 rank</th><th>rerank score</th><th>preview</th></tr>
+    ${lastRetrieval.map((t, i) => `<tr>
+      <td class="name" style="color:var(--teal)">${i + 1}</td>
+      <td>${esc(t.id)}</td><td>${esc(t.tier || '—')}</td>
+      <td>${t.stage1_rank ?? '—'}</td>
+      <td>${t.score !== null && t.score !== undefined ? Number(t.score).toFixed(3) : '—'}</td>
+      <td style="font-family:inherit;color:var(--muted)">${esc((t.text || '').substring(0, 70))}</td></tr>`).join('')}
+  </table>`;
+}
 
-// ── Boot ─────────────────────────────────────────────────────────────────────
-(async () => {
-  await checkHealth();
-  await refreshMemories();
-  await refreshTimeline();
-  // Sample messages hint
-  addMessage('👋 Demo mode. Try: "I live in Chennai." → then "Where do I live?" Watch the Decisions and Timeline tabs update.', 'system');
+/* ── Evaluation ───────────────────────────────────── */
+document.querySelectorAll('#eval-tabs .tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('#eval-tabs .tab').forEach(x => x.classList.remove('active'));
+  t.classList.add('active'); evalDs = t.dataset.ds; renderEvaluation();
+}));
+
+async function loadEvaluation() {
+  const {data} = await api('/api/benchmarks');
+  experiments = data.experiments || [];
+  jobs = data.jobs || [];
+  // strategy checkboxes
+  const box = $('eval-strategies');
+  if (!box.dataset.built) {
+    const strategies = data.strategies || [];
+    box.innerHTML = strategies.map((s, i) =>
+      `<label title="${esc(s.description)}"><input type="checkbox" value="${esc(s.name)}" ${i < 3 ? 'checked' : ''}> ${esc(s.name)}</label>`).join('');
+    box.dataset.built = '1';
+  }
+  renderEvaluation();
+  refreshJobs();
+}
+
+function dsMatches(e, ds) {
+  const n = (e.dataset_name || '').toLowerCase();
+  if (ds === 'synthetic') return n.includes('synthetic');
+  return n.includes(ds);
+}
+
+function renderEvaluation() {
+  $('eval-ds-name').textContent = evalDs;
+  const exps = experiments.filter(e => dsMatches(e, evalDs));
+  const box = $('eval-experiments');
+  box.innerHTML = exps.length ? exps.map(expCard).join('')
+    : '<div class="empty">No exported experiment for this dataset yet — run a comparison below, or check the run log.</div>';
+
+  // coverage table
+  const names = ['none', 'full_history', 'memoryos', 'memory_r1', 'hmem'];
+  const executed = new Set();
+  exps.filter(e => e.type === 'comparison').forEach(e => (e.rows || []).forEach(r => executed.add(r.name)));
+  const singleRuns = exps.filter(e => e.type === 'comparison').length;
+  $('eval-coverage').innerHTML =
+    '<tr><th>strategy</th><th>status</th><th>artifact</th></tr>' +
+    names.map(n => {
+      const on = executed.has(n);
+      return `<tr class="${on ? '' : 'pending'}"><td class="name">${n}</td>
+        <td>${on ? '<span class="badge b-teal">EXECUTED</span>' : '<span class="badge b-grey">PENDING · not run</span>'}</td>
+        <td>${on ? (experiments.filter(e => e.type === 'comparison' && dsMatches(e, evalDs) &&
+             (e.rows || []).some(r => r.name === n)).map(e => e.file).join(', ')) : '—'}</td></tr>`;
+    }).join('') +
+    (singleRuns === 0 ? `<tr class="pending"><td class="name">single --baseline runs</td>
+      <td><span class="badge b-grey">PENDING</span></td><td>—</td></tr>` : '');
+
+  // F1 chart — comparison experiments (first one per dataset wins the chart)
+  const comp = exps.filter(e => e.type === 'comparison').sort((a,b) =>
+    (b.modified || '').localeCompare(a.modified || ''))[0];
+  const chart = $('eval-f1chart');
+  if (comp && (comp.rows || []).length) {
+    const rows = comp.rows;
+    const max = Math.max(...rows.map(r => r.mean_f1 ?? 0), 0.2);
+    chart.innerHTML = rows.map(r => mrow(r.name, r.mean_f1, max)).join('') +
+      `<div class="legend">source: <span class="mono">${esc(comp.file)}</span> · ${comp.num_cases} case(s) · metric k=${comp.k}</div>`;
+  } else {
+    chart.innerHTML = '<div class="empty">No results for this dataset yet.</div>';
+  }
+}
+
+function mrow(name, v, max) {
+  const pct = v === null || v === undefined ? 0 : Math.round(v / max * 100);
+  return `<div class="mrow"><div class="mname" title="${esc(name)}">${esc(name)}</div>
+    <div class="mtrack">${v === null || v === undefined ? '' : `<div class="mfill" style="width:${Math.max(2, pct)}%"></div>`}</div>
+    <div class="mval">${v === null || v === undefined ? 'n/a' : Number(v).toFixed(3)}</div></div>`;
+}
+
+function expCard(e) {
+  const cols = ['name', 'mean_f1', 'mean_bleu1', 'mean_recall_at_k', 'mean_precision_at_k', 'mrr', 'mean_tokens', 'mean_latency_ms', 'num_queries'];
+  const heads = ['strategy', 'F1', 'BLEU-1', 'Recall@K', 'P@K', 'MRR', 'tokens', 'latency ms', 'queries'];
+  return `<div class="card" style="margin-bottom:13px;background:var(--panel2)">
+    <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+      <span class="badge ${e.type === 'ablation' ? 'b-violet' : 'b-cyan'}">${(e.ablation || e.type || '').toUpperCase()}</span>
+      <span class="jname">${esc(e.file)}</span>
+      <span class="hint">${esc(e.dataset_name || '')} · ${e.num_cases} case(s) · k=${e.k} · ${(e.modified || '').substring(0, 10)}</span>
+    </div>
+    <div style="overflow-x:auto"><table class="tbl">
+      <tr>${heads.map(h => `<th>${h}</th>`).join('')}</tr>
+      ${(e.rows || []).map(r => `<tr>
+        <td class="name">${esc(r.name)}${r.kind ? ` <span class="badge b-grey">${esc(r.kind)}</span>` : ''}</td>
+        ${cols.slice(1).map(c => `<td class="${r[c] === null || r[c] === undefined ? 'na' : ''}">${r[c] === null || r[c] === undefined ? '—'
+          : (c === 'mean_latency_ms' ? Number(r[c]).toFixed(1)
+          : c === 'num_queries' ? r[c]
+          : c === 'mean_tokens' ? Number(r[c]).toFixed(1)
+          : Number(r[c]).toFixed(3))}</td>`).join('')}
+      </tr>`).join('')}
+    </table></div></div>`;
+}
+
+async function runComparison() {
+  const strategies = [...$('eval-strategies').querySelectorAll('input:checked')].map(i => i.value);
+  if (!strategies.length) return toast('Select at least one strategy');
+  const sample = $('eval-sample').value;
+  const {ok, status, data} = await api('/api/benchmarks/run', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({dataset: evalDs, kind: 'compare', strategies, sample}),
+  });
+  if (!ok) return toast(data.error || ('Run rejected (' + status + ')'));
+  toast('Comparison started — watch the run log below', true);
+  refreshJobs(true);
+}
+
+/* ── Ablation ─────────────────────────────────────── */
+async function loadAblation() {
+  const {data} = await api('/api/benchmarks');
+  experiments = data.experiments || [];
+  jobs = data.jobs || [];
+  renderAblation();
+  refreshJobs();
+}
+
+function ablKey(ds, ablation) {
+  return experiments.find(e => e.type === 'ablation' && e.ablation === ablation && dsMatches(e, ds));
+}
+
+function renderAblation() {
+  const ds = $('abl-ds').value;
+  const families = [
+    {sel: 'abl-result-stage', ablation: 'retrieval_stage'},
+    {sel: 'abl-result-k', ablation: 'k'},
+    {sel: 'abl-result-budget', ablation: 'token_budget'},
+    {sel: 'abl-result-signal', ablation: 'signal:' + $('abl-signal').value},
+  ];
+  families.forEach(f => {
+    const e = ablKey(ds, f.ablation);
+    const box = $(f.sel);
+    if (!e) {
+      box.innerHTML = '<div class="empty">Not executed for the selected dataset.</div>';
+      return;
+    }
+    const rows = e.rows || [];
+    const max = Math.max(...rows.map(r => r.mean_f1 ?? 0), 0.2);
+    box.innerHTML = expCard(e) +
+      `<div class="mchart" style="margin-top:9px">${rows.map(r => mrow(r.name, r.mean_f1, max)).join('')}</div>`;
+  });
+}
+$('abl-ds').addEventListener('change', renderAblation);
+$('abl-signal').addEventListener('change', renderAblation);
+
+async function runAblation(kind) {
+  const dataset = $('abl-ds').value;
+  const sample = $('abl-sample').value;
+  let spec = {kind};
+  if (kind === 'k' || kind === 'budget') {
+    const raw = $(kind === 'k' ? 'abl-k-values' : 'abl-budget-values').value;
+    const values = raw.split(',').map(s => parseInt(s.trim(), 10)).filter(v => v > 0);
+    if (!values.length) return toast('Enter comma-separated positive integers');
+    spec.values = values;
+  }
+  if (kind === 'signal') spec.signal = $('abl-signal').value;
+
+  const {ok, status, data} = await api('/api/benchmarks/run', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({dataset, kind: 'ablate', ablation: spec, sample}),
+  });
+  if (!ok) return toast(data.error || ('Run rejected (' + status + ')'));
+  toast('Ablation started — watch the run log below', true);
+  refreshJobs(true);
+}
+
+function confirmClearArtifacts() {
+  alert('Artifacts live in the results/ folder (git-ignored). Delete them in the terminal:\n\n  del results\\*.json results\\*.csv   (Windows)\n  rm results/*                        (macOS/Linux)');
+}
+
+/* ── Jobs (shared by Evaluation & Ablation) ───────── */
+async function refreshJobs() {
+  const {ok, data} = await api('/api/benchmarks');
+  if (!ok) return;
+  experiments = data.experiments || [];
+  jobs = data.jobs || [];
+  renderJobLists();
+  const running = jobs.some(j => j.status === 'running');
+  if (running) {
+    if (!jobPoll) jobPoll = setInterval(refreshJobs, 2500);
+  } else if (jobPoll) {
+    clearInterval(jobPoll); jobPoll = null;
+    toast('Run finished', true);
+    if (document.querySelector('#view-evaluation').classList.contains('active')) renderEvaluation();
+    if (document.querySelector('#view-ablation').classList.contains('active')) renderAblation();
+  }
+}
+
+function renderJobLists() {
+  const html = jobs.length ? jobs.map(j => {
+    const badge = j.status === 'running' ? '<span class="badge b-amber">RUNNING</span>'
+      : j.status === 'done' ? '<span class="badge b-teal">DONE</span>'
+      : '<span class="badge b-red">FAILED' + (j.exit_code !== null ? ' · exit ' + j.exit_code : '') + '</span>';
+    return `<div class="job"><div class="jhead">
+        ${badge}<span class="jname">${esc(j.name)}</span>
+        <span class="hint">${esc(j.dataset)} · ${esc(j.kind)}${j.sample ? ' · n=' + esc(String(j.sample)) : ''}</span>
+        ${j.status === 'running' ? '<span class="spin" style="margin-left:auto"></span>' : ''}
+      </div>
+      <div class="hint mono" style="margin-top:5px;font-size:10.7px">${esc((j.argv || []).join(' '))}</div>
+      ${j.error ? `<div style="color:var(--red);font-size:11.5px;margin-top:6px">${esc(j.error)}</div>` : ''}
+      ${j.log && j.status !== 'running' ? `<details style="margin-top:7px"><summary style="font-size:11px;color:var(--dim);cursor:pointer">output log</summary><div class="jlog">${esc(j.log)}</div></details>` : ''}
+    </div>`;
+  }).join('') : '<div class="empty">No jobs this session.</div>';
+  const a = $('eval-jobs'), b = $('abl-jobs');
+  if (a) a.innerHTML = html;
+  if (b) b.innerHTML = html;
+  const anyRunning = jobs.some(j => j.status === 'running');
+  document.querySelectorAll('.btn-run, #eval-run-btn').forEach(btn => btn.disabled = anyRunning);
+}
+
+/* ── Boot ─────────────────────────────────────────── */
+(async function boot() {
+  addMsg('sys', 'Connected to the MemAge backend. Chat is grounded in the tiered memory store — try: “I live in Bengaluru.” then “Where do I live?”');
+  await loadHealth();
+  loadOverview();
+  loadEvaluation();
+  refreshJobs();
 })();
 </script>
 </body>

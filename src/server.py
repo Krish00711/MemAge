@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -40,6 +41,18 @@ from typing import Any
 # ---------------------------------------------------------------------------
 _TIMELINE: list[dict] = []
 _TIMELINE_LOCK = threading.Lock()
+
+# Session-scoped live statistics (reset when the process restarts).  Every
+# number below is incremented from a REAL request — nothing is estimated.
+_STATS: dict = {
+    "chats": 0,
+    "retrieved_memories": 0,
+    "latency_ms_total": 0.0,
+    "tokens_total": 0,
+    "llm_calls": 0,
+    "decisions": {"ADD": 0, "UPDATE": 0, "DELETE": 0, "NOOP": 0},
+    "started": datetime.now(timezone.utc).isoformat(),
+}
 
 
 def _log_event(action: str, candidate: dict, decision: dict) -> None:
@@ -304,6 +317,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._handle_list_memories()
         if path == "/api/timeline":
             return self._handle_timeline()
+        if path == "/api/benchmarks":
+            return self._handle_benchmarks()
 
         mem_prefix = "/api/memories/"
         if path.startswith(mem_prefix):
@@ -316,6 +331,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = self._path()
         if path == "/api/chat":
             return self._handle_chat()
+        if path == "/api/benchmarks/run":
+            return self._handle_benchmark_run()
         self._send_json({"error": "not found"}, 404)
 
     # --- DELETE ---
@@ -353,13 +370,34 @@ class _Handler(BaseHTTPRequestHandler):
         counts = _store.count()
         is_demo = isinstance(_store, _DemoStore)
         provider = "demo" if is_demo else os.environ.get("LLM_PROVIDER", "(not set)")
+        if is_demo:
+            model = "deterministic-stub (offline demo)"
+        else:
+            model = os.environ.get(f"{provider.strip().upper()}_MODEL", "").strip() or "(default)"
+        with _TIMELINE_LOCK:
+            timeline_count = len(_TIMELINE)
         self._send_json({
             "ok": True,
             "provider": provider,
+            "model": model,
             "is_demo": is_demo,
             "counts": counts,
+            "total": sum(counts.values()) if isinstance(counts, dict) else 0,
             "stm_capacity": getattr(_store, "stm_capacity", 20),
             "mtm_capacity": getattr(_store, "mtm_capacity", 100),
+            "stats": {
+                **_STATS,
+                "timeline_events": timeline_count,
+                "avg_latency_ms": (
+                    round(_STATS["latency_ms_total"] / _STATS["chats"], 1)
+                    if _STATS["chats"] else 0
+                ),
+            },
+            "agent": {
+                "token_budget": getattr(_agent, "_token_budget", None),
+                "k": getattr(_agent, "_k", None),
+            },
+            "datasets": _datasets_available(),
         })
 
     def _handle_list_memories(self) -> None:
@@ -395,14 +433,20 @@ class _Handler(BaseHTTPRequestHandler):
         if hasattr(_store, "reset"):
             _store.reset()
         else:
-            # Real store: delete all from all tiers
-            for tier in ("STM", "MTM", "LTM"):
-                try:
-                    items = _store.query("the", k=500, tier=tier)
-                    for item in items:
+            # Real store: delete every stored item across all tiers.
+            if hasattr(_store, "list_all"):
+                for item in _store.list_all():
+                    try:
                         _store.delete(item["id"])
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+            else:
+                for tier in ("STM", "MTM", "LTM"):
+                    try:
+                        for item in _store.query("the", k=500, tier=tier):
+                            _store.delete(item["id"])
+                    except Exception:
+                        pass
         with _TIMELINE_LOCK:
             _TIMELINE.clear()
         self._send_json({"reset": True})
@@ -418,22 +462,75 @@ class _Handler(BaseHTTPRequestHandler):
         if not message:
             return self._send_json({"error": "message is required"}, 400)
 
+        # Exact timing + real provider token usage for this request.
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+        try:
+            from src.llm import client as _llm_client
+            _llm_client.usage_reset()
+        except Exception:
+            _llm_client = None
+        t0 = time.perf_counter()
         resp = _agent.chat(message, session_id=session_id)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        if _llm_client is not None:
+            usage = _llm_client.usage_snapshot()
 
-        # Log ingestion events to timeline
+        # Log ingestion events to timeline + count every controller decision
         if resp.turn_result:
             for cr in resp.turn_result.candidates:
-                if cr.decision["action"] != "NOOP":
-                    _log_event(cr.decision["action"], cr.candidate, cr.decision)
+                action = cr.decision.get("action")
+                if action in _STATS["decisions"]:
+                    _STATS["decisions"][action] += 1
+                if action != "NOOP":
+                    _log_event(action, cr.candidate, cr.decision)
+
+        _STATS["chats"] += 1
+        _STATS["retrieved_memories"] += len(resp.retrieved_ids or [])
+        _STATS["latency_ms_total"] += latency_ms
+        _STATS["tokens_total"] += usage.get("total_tokens", 0)
+        _STATS["llm_calls"] += usage.get("calls", 0)
 
         self._send_json({
             "answer": resp.answer,
             "context": resp.context,
             "retrieved_ids": resp.retrieved_ids,
+            "retrieval_trace": resp.retrieval_trace,
             "turn_result": _serialise_turn_result(resp.turn_result),
             "ok": resp.ok,
             "error": resp.error,
+            "latency_ms": latency_ms,
+            "usage": usage,
         })
+
+
+# --- benchmark artifacts & background jobs -----------------------------
+
+    def _handle_benchmarks(self) -> None:
+        """List exported benchmark artifacts + in-flight run jobs."""
+        self._send_json({
+            "experiments": _load_experiments(),
+            "jobs": _jobs_list(),
+            "datasets": _datasets_available(),
+            "strategies": _strategy_catalog(),
+        })
+
+    def _handle_benchmark_run(self) -> None:
+        """Start ONE background benchmark/ablation run (never concurrent).
+
+        The repository CLI (``python -m src.eval.run_benchmark``) is reused
+        verbatim — the API only validates input, builds the argv and exports
+        into ``results/``.  Nothing runs unless a client explicitly calls
+        this endpoint.
+        """
+        body = self._read_body()
+        err, argv, name = _build_benchmark_argv(body)
+        if err:
+            return self._send_json({"error": err}, 400)
+
+        job, conflict = _start_job(name, argv, body)
+        if conflict:
+            return self._send_json({"error": conflict, "job": job}, 409)
+        self._send_json({"job": job}, 202)
 
 
 def _serialise_turn_result(tr) -> dict | None:
@@ -455,6 +552,288 @@ def _serialise_turn_result(tr) -> dict | None:
         "deleted": tr.deleted,
         "noops": tr.noops,
     }
+
+
+# ---------------------------------------------------------------------------
+# Benchmark artifacts (results/) — read-only exposure for the UI
+# ---------------------------------------------------------------------------
+
+_RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+_DATASETS = ("synthetic", "locomo", "longmemeval")
+_STRATEGY_ORDER = ("none", "full_history", "memoryos", "memory_r1", "hmem")
+_SIGNAL_NAMES = ("importance", "temporal", "contradiction", "storage")
+_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _datasets_available() -> dict:
+    """Which benchmark datasets can actually load from the repo data dir."""
+    out: dict = {"synthetic": True}
+    try:
+        from src.eval.adapters import resolve_dataset_file
+    except Exception:
+        return {ds: False for ds in _DATASETS}
+    for ds in ("locomo", "longmemeval"):
+        try:
+            resolve_dataset_file(ds, None)
+            out[ds] = True
+        except Exception:
+            out[ds] = False
+    return out
+
+
+def _strategy_catalog() -> list:
+    """Canonical strategy names + descriptions (from the benchmark CLI)."""
+    try:
+        from src.eval.run_benchmark import SUPPORTED_BASELINES
+        return [{"name": n, "description": SUPPORTED_BASELINES[n]}
+                for n in _STRATEGY_ORDER if n in SUPPORTED_BASELINES]
+    except Exception:
+        return [{"name": n, "description": ""} for n in _STRATEGY_ORDER]
+
+
+def _row_metrics(report: dict) -> dict:
+    """Project a BenchmarkReport dict down to its aggregate metrics."""
+    if not isinstance(report, dict):
+        return {}
+    return {key: report.get(key) for key in (
+        "mean_f1", "mean_bleu1", "mean_recall_at_k", "mean_precision_at_k",
+        "mrr", "mean_tokens", "mean_latency_ms", "num_queries",
+    )}
+
+
+def _strategy_rows(results: list, kinds: dict | None = None) -> list:
+    """"results" list -> flat rows of {name, kind, metrics...}."""
+    rows = []
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        name = r.get("name", "?")
+        rows.append({
+            "name": name,
+            "kind": (kinds or {}).get(name, ""),
+            **_row_metrics(r.get("report")),
+        })
+    return rows
+
+
+def _load_experiments() -> list:
+    """Parse every exported ``results/*.json`` into a UI-ready record.
+
+    Recognises the two shapes the benchmark CLI exports:
+    ``ComparisonResult`` ({dataset_name,k,num_cases,results}) and
+    ``AblationResult`` ({ablation,configs,comparison}).  Files that match
+    neither schema are skipped (never guessed at).
+    """
+    experiments: list = []
+    if not _RESULTS_DIR.is_dir():
+        return experiments
+    for fp in sorted(_RESULTS_DIR.glob("*.json")):
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        record: dict = {
+            "file": fp.name,
+            "modified": datetime.fromtimestamp(
+                fp.stat().st_mtime, timezone.utc
+            ).isoformat(),
+        }
+        if isinstance(data.get("comparison"), dict) and "ablation" in data:
+            comp = data["comparison"]
+            kinds = {c.get("label"): c.get("kind", "")
+                     for c in data.get("configs", []) if isinstance(c, dict)}
+            record.update(
+                type="ablation",
+                ablation=data.get("ablation", ""),
+                dataset_name=comp.get("dataset_name"),
+                k=comp.get("k"),
+                num_cases=comp.get("num_cases"),
+                configs=list(kinds.keys()),
+                rows=_strategy_rows(comp.get("results"), kinds),
+            )
+        elif "dataset_name" in data and isinstance(data.get("results"), list):
+            record.update(
+                type="comparison",
+                ablation="",
+                dataset_name=data.get("dataset_name"),
+                k=data.get("k"),
+                num_cases=data.get("num_cases"),
+                rows=_strategy_rows(data.get("results")),
+            )
+        else:
+            continue  # unrelated JSON — do not fabricate a record
+        experiments.append(record)
+    return experiments
+
+
+# ---------------------------------------------------------------------------
+# Background benchmark jobs (one at a time, quota-safe)
+# ---------------------------------------------------------------------------
+
+_JOBS: dict = {}
+_JOBS_LOCK = threading.Lock()
+_MAX_SAMPLE = 20  # hard cap: a "small smoke run" cannot be turned into a full
+
+
+def _jobs_list() -> list:
+    with _JOBS_LOCK:
+        return sorted(_JOBS.values(), key=lambda j: j["started"], reverse=True)
+
+
+def _any_job_running() -> dict | None:
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if job["status"] == "running":
+                return job
+    return None
+
+
+def _build_benchmark_argv(body: dict) -> tuple:
+    """Validate a run request.
+
+    Returns ``(error, argv, name)`` — *error* is ``None`` on success.
+    Only whitelisted values are accepted; nothing from the request reaches
+    the shell (the CLI runs in-process, argv is a list, never a string).
+    """
+    dataset = str(body.get("dataset", "")).strip()
+    kind = str(body.get("kind", "")).strip()
+    if dataset not in _DATASETS:
+        return f"dataset must be one of {list(_DATASETS)}", None, None
+    if dataset != "synthetic" and not _datasets_available().get(dataset):
+        return f"dataset '{dataset}' is not available locally (see data/README.md)", None, None
+    if kind not in ("compare", "ablate"):
+        return "kind must be 'compare' or 'ablate'", None, None
+
+    argv = ["--dataset", dataset]
+    name_parts = [dataset]
+
+    if kind == "compare":
+        strategies = body.get("strategies") or []
+        if not isinstance(strategies, list) or not strategies:
+            return "strategies must be a non-empty list", None, None
+        names = [str(s).strip() for s in strategies]
+        bad = [n for n in names if n not in _STRATEGY_ORDER]
+        if bad:
+            return f"unknown strategies {bad}; supported: {list(_STRATEGY_ORDER)}", None, None
+        if len(set(names)) != len(names):
+            return "duplicate strategy names", None, None
+        argv += ["--compare", ",".join(names)]
+        name_parts += ["compare", "-".join(names)]
+    else:
+        spec = body.get("ablation") or {}
+        akind = str(spec.get("kind", "")).strip()
+        if akind == "stage":
+            ablate_arg = "stage"
+            name_parts += ["ablate", "stage"]
+        elif akind in ("k", "budget"):
+            values = spec.get("values") or []
+            if not isinstance(values, list) or not values:
+                return f"ablation '{akind}' needs a non-empty values list", None, None
+            try:
+                ints = [int(v) for v in values]
+            except (TypeError, ValueError):
+                return "ablation values must be integers", None, None
+            if any(v <= 0 for v in ints):
+                return "ablation values must be > 0", None, None
+            ablate_arg = f"{akind}:" + ",".join(str(v) for v in ints)
+            name_parts += ["ablate", akind]
+        elif akind == "signal":
+            sig = str(spec.get("signal", "")).strip()
+            if sig not in _SIGNAL_NAMES:
+                return f"signal must be one of {list(_SIGNAL_NAMES)}", None, None
+            ablate_arg = f"signal:{sig}"
+            name_parts += ["ablate", sig]
+        else:
+            return ("ablation.kind must be one of stage, k, budget, signal",
+                    None, None)
+        argv += ["--ablate", ablate_arg]
+
+    sample = body.get("sample")
+    if sample not in (None, "", 0):
+        try:
+            sample = int(sample)
+        except (TypeError, ValueError):
+            return "sample must be an integer", None, None
+        if sample <= 0 or sample > _MAX_SAMPLE:
+            return f"sample must be between 1 and {_MAX_SAMPLE}", None, None
+        argv += ["--sample", str(sample)]
+        name_parts.append(f"n{sample}")
+
+    for flag, key in (("--k", "k"), ("--token-budget", "token_budget")):
+        val = body.get(key)
+        if val not in (None, "", 0):
+            try:
+                val = int(val)
+            except (TypeError, ValueError):
+                return f"{key} must be an integer", None, None
+            if val <= 0:
+                return f"{key} must be > 0", None, None
+            argv += [flag, str(val)]
+
+    raw_name = str(body.get("name", "")).strip() or "_".join(name_parts)
+    name = _NAME_RE.sub("_", raw_name).strip("._-")[:80] or "run"
+    return None, argv, name
+
+
+def _start_job(name: str, argv: list, body: dict) -> tuple:
+    """Create + launch one background job.  Returns ``(job, conflict)``."""
+    running = _any_job_running()
+    if running:
+        return running, (
+            "a benchmark job is already running — wait for it to finish "
+            "(quota-safe single-concurrency limit)"
+        )
+
+    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    json_path = _RESULTS_DIR / f"{name}.json"
+    csv_path = _RESULTS_DIR / f"{name}.csv"
+    job_id = f"{int(time.time())}-{name}"
+    job = {
+        "id": job_id,
+        "name": name,
+        "dataset": str(body.get("dataset", "")),
+        "kind": str(body.get("kind", "")),
+        "argv": argv + ["--export-json", str(json_path),
+                        "--export-csv", str(csv_path)],
+        "sample": body.get("sample"),
+        "status": "running",
+        "started": datetime.now(timezone.utc).isoformat(),
+        "finished": None,
+        "exit_code": None,
+        "error": None,
+        "log": "",
+    }
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+
+    def _runner() -> None:
+        import contextlib
+        import io as _io
+        buf = _io.StringIO()
+        code: int | None = None
+        try:
+            from src.eval.run_benchmark import main as _bench_main
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                code = _bench_main(job["argv"])
+        except Exception as exc:  # provider/dependency failures, not crashes
+            buf.write(f"\n[job crashed] {type(exc).__name__}: {exc}\n")
+            job["error"] = f"{type(exc).__name__}: {exc}"
+            job["status"] = "failed"
+        finally:
+            job["log"] = buf.getvalue()[-6000:]
+            job["exit_code"] = code
+            if job["status"] == "running":
+                job["status"] = "done" if code == 0 else "failed"
+                if code not in (0, None) and not job["error"]:
+                    job["error"] = f"benchmark exited with code {code}"
+            job["finished"] = datetime.now(timezone.utc).isoformat()
+
+    thread = threading.Thread(target=_runner, daemon=True, name=f"bench-{name}")
+    thread.start()
+    return job, None
 
 
 # ---------------------------------------------------------------------------

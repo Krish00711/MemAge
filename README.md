@@ -194,6 +194,59 @@ F1 / BLEU-1 / Recall@K / P@K / MRR / tokens / latency. Missing dataset
 files exit 2 with the expected path; a missing LLM/embedder dependency
 exits 2 with the dependency named.
 
+## Web app (presentation UI + API)
+
+The repository ships a zero-dependency web server (`src/server.py`, Python
+stdlib only) that serves both the JSON API and the presentation dashboard
+(`static/index.html`, a single-file matte-dark UI — no build step, no CDN).
+
+```bash
+python -m src.server --port 8000            # real store + configured LLM provider
+python -m src.server --port 8000 --demo     # offline: fake store + stub LLM (no key needed)
+```
+
+Open <http://localhost:8000>. Sections: **Overview** (live counts, provider,
+health), **AI Chat** (grounded answers + retrieved-memory chips, real latency
+and provider token usage), **Memory Architecture** (STM → MTM → LTM with the
+actual stored memories and controller decisions), **Pipeline Monitor**
+(static architecture next to *actual* live events and the last retrieval
+trace), **Evaluation** (baseline tables/charts from exported artifacts), and
+**Ablation Studies** (run stage / k / budget / signal ablations on demand).
+
+### API contract (no authentication; CORS `*`; never exposes API keys)
+
+| Method & path | Purpose | Response |
+|---|---|---|
+| `GET /api/health` | status + config | `{ok, provider, model, is_demo, counts:{STM,MTM,LTM}, total, stm_capacity, mtm_capacity, stats:{chats, decisions:{ADD,UPDATE,DELETE,NOOP}, retrieved_memories, tokens_total, avg_latency_ms, timeline_events, started}, agent:{token_budget, k}, datasets:{synthetic,locomo,longmemeval}}` |
+| `POST /api/chat` | one chat turn | `{answer, context, retrieved_ids, retrieval_trace:[{id,score,stage1_rank,tier,text,timestamp}], turn_result:{candidates:[{id,text,decision:{action,target_id,scores},ok,error}],added,updated,deleted,noops}, ok, error, latency_ms, usage:{prompt_tokens,completion_tokens,total_tokens,calls}}` |
+| `GET /api/memories?tier=&q=` | list memories | `{items:[{id,text,timestamp,source,tier,access_count,distance}], total}` |
+| `GET /api/memories/<id>` | one memory | the memory object |
+| `DELETE /api/memories/<id>` | delete one | `{deleted}` |
+| `DELETE /api/memories?confirm=true` | reset all | `{reset:true}` |
+| `GET /api/timeline` | ingestion event log (in-memory, this process) | `{events:[{ts,action,candidate_id,candidate_text,scores,target_id}]}` |
+| `GET /api/benchmarks` | exported artifacts + run jobs + dataset availability | `{experiments:[{file,type,dataset_name,k,num_cases,rows:[{name,kind,mean_f1,…}]}], jobs:[…], datasets, strategies}` |
+| `POST /api/benchmarks/run` | start ONE background benchmark/ablation run | `202 {job}` or `400 {error}` / `409 {error, job}` |
+
+`POST /api/benchmarks/run` body examples:
+
+```jsonc
+{"dataset":"locomo","kind":"compare","strategies":["none","full_history","memoryos"],"sample":2}
+{"dataset":"locomo","kind":"ablate","ablation":{"kind":"k","values":[1,3,5]},"sample":2}
+{"dataset":"locomo","kind":"ablate","ablation":{"kind":"signal","signal":"importance"},"sample":1}
+```
+
+It validates against a whitelist, caps `sample` at 20, runs the existing
+`python -m src.eval.run_benchmark` in-process (one job at a time — quota-safe)
+and exports `results/<name>.json` / `results/<name>.csv`. Nothing runs unless
+the endpoint is called; the UI never starts experiments automatically.
+
+### Artifacts
+
+Benchmark exports live in `results/` (git-ignored). The Evaluation /
+Ablation views read them directly (`GET /api/benchmarks`) and show
+**PENDING** for strategies that were never executed — scores are never
+fabricated in the browser.
+
 ## Branching & PRs
 
 See `CONTRIBUTING.md`.

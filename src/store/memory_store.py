@@ -294,5 +294,33 @@ class TieredMemoryStore:
         self.rebalance()
         return top
 
+    def list_all(self, tier: str = "all", q: str = "", limit: int = 1000) -> list[dict]:
+        """Return stored memories WITHOUT a similarity query (UI listing).
+
+        Unlike :meth:`query` this is read-only: it does not bump access
+        counts, does not rebalance tiers and does not need an embedding —
+        it walks each tier collection wholesale so the web UI can show
+        every stored item (query() would only ever return the k nearest
+        neighbours of some probe text).
+
+        Args:
+            tier: ``"all"`` (default) or a single tier name.
+            q: Optional case-insensitive substring filter on the text.
+            limit: Maximum number of items returned (newest first).
+        """
+        if tier != "all" and tier not in TIERS:
+            raise ValueError(f"tier must be one of 'all' or {TIERS}")
+        tiers = TIERS if tier == "all" else (tier,)
+        items: list[dict] = []
+        needle = (q or "").lower()
+        for t in tiers:
+            res = self._cols[t].get(include=["documents", "metadatas"])
+            for item_id, text, meta in zip(res["ids"], res["documents"], res["metadatas"]):
+                if needle and needle not in (text or "").lower():
+                    continue
+                items.append(self._to_item(item_id, text, meta, t))
+        items.sort(key=lambda i: str(i.get("timestamp") or ""), reverse=True)
+        return items[:limit]
+
     def count(self) -> dict:
         return {t: c.count() for t, c in self._cols.items()}

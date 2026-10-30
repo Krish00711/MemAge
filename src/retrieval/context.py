@@ -78,6 +78,84 @@ class RetrievalContext:
                 raise TypeError("formatter_fn must be callable")
             self.formatter_fn = formatter_fn
 
+    def retrieve_with_trace(
+        self, query: str, token_budget: int
+    ) -> tuple[str, list[str], list[dict]]:
+        """Run the full pipeline and return context, selected IDs and a trace.
+
+        Same pipeline as :meth:`retrieve_ranked` (Stage-1 coarse retrieval →
+        Stage-2 reranking → token-budget selection → formatting) plus a
+        per-memory **trace** of what reached the prompt — used by the
+        observability layer (server / UI) to show the retrieval stage.
+
+        Args:
+            query: Natural-language query string.
+            token_budget: Maximum estimated tokens for the final context.
+                Must be a positive integer.
+
+        Returns:
+            ``(context, selected_ids, trace)`` where *trace* is one dict per
+            memory that survived token-budget selection, in final display
+            order::
+
+                {"id", "score", "stage1_rank", "term"... "tier",
+                 "text" (preview), "timestamp"}
+
+            ``score``/``stage1_rank`` are ``None`` when the reranker output
+            does not carry them (deterministic rerankers return plain
+            ``RankedCandidate`` scores; lexical fallbacks may be ``0.0``).
+
+        Raises:
+            ValueError: If ``token_budget`` is not a positive integer.
+        """
+        if not isinstance(token_budget, int) or isinstance(token_budget, bool):
+            raise ValueError(f"token_budget must be a positive integer, got {token_budget!r}")
+        if token_budget <= 0:
+            raise ValueError(f"token_budget must be > 0, got {token_budget}")
+
+        # Stage-1: coarse retrieval
+        candidates = self.retriever.retrieve(query, k=self.k, tier=self.tier)
+
+        # Stage-2: LLM-guided reranking
+        ranked = self.reranker.rerank(query, candidates)
+
+        # Budget selection (selector handles its own token_budget validation,
+        # but we validated above as well for immediate error)
+        selected = self.selector(ranked, token_budget)
+
+        # Formatting
+        context = self.formatter_fn(selected)
+
+        # Stage-1 rank + rerank score lookup (id -> (rank, score))
+        stage1_rank: dict[str, int] = {}
+        rank_score: dict[str, Any] = {}
+        for pos, item in enumerate(ranked, start=1):
+            candidate = getattr(item, "candidate", item)
+            cid = candidate.get("id") if isinstance(candidate, dict) else None
+            if isinstance(cid, str) and cid not in stage1_rank:
+                stage1_rank[cid] = pos  # first occurrence = Stage-1 order
+                rank_score[cid] = getattr(item, "score", None)
+
+        # IDs + trace of the final selection, in final (display) order
+        selected_ids: list[str] = []
+        trace: list[dict] = []
+        for item in selected:
+            candidate = getattr(item, "candidate", item)
+            cid = candidate.get("id") if isinstance(candidate, dict) else None
+            if not isinstance(cid, str):
+                continue
+            selected_ids.append(cid)
+            trace.append({
+                "id": cid,
+                "score": getattr(item, "score", None),
+                "stage1_rank": stage1_rank.get(cid),
+                "tier": candidate.get("tier"),
+                "text": str(candidate.get("text", ""))[:200],
+                "timestamp": candidate.get("timestamp"),
+            })
+
+        return context, selected_ids, trace
+
     def retrieve_ranked(
         self, query: str, token_budget: int
     ) -> tuple[str, list[str]]:
@@ -106,32 +184,9 @@ class RetrievalContext:
         Raises:
             ValueError: If ``token_budget`` is not a positive integer.
         """
-        if not isinstance(token_budget, int) or isinstance(token_budget, bool):
-            raise ValueError(f"token_budget must be a positive integer, got {token_budget!r}")
-        if token_budget <= 0:
-            raise ValueError(f"token_budget must be > 0, got {token_budget}")
-
-        # Stage-1: coarse retrieval
-        candidates = self.retriever.retrieve(query, k=self.k, tier=self.tier)
-
-        # Stage-2: LLM-guided reranking
-        ranked = self.reranker.rerank(query, candidates)
-
-        # Budget selection (selector handles its own token_budget validation,
-        # but we validated above as well for immediate error)
-        selected = self.selector(ranked, token_budget)
-
-        # Formatting
-        context = self.formatter_fn(selected)
-
-        # IDs of the final selection, in final (display) order
-        selected_ids: list[str] = []
-        for item in selected:
-            candidate = getattr(item, "candidate", item)
-            cid = candidate.get("id") if isinstance(candidate, dict) else None
-            if isinstance(cid, str):
-                selected_ids.append(cid)
-
+        context, selected_ids, _trace = self.retrieve_with_trace(
+            query, token_budget
+        )
         return context, selected_ids
 
     def retrieve_context(self, query: str, token_budget: int) -> str:

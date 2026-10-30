@@ -16,7 +16,60 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
+
+# ---------------------------------------------------------------------------
+# Per-request token accounting (observability for the web UI)
+#
+# Groq's completion objects carry real ``usage`` numbers.  We accumulate
+# them in a THREAD-LOCAL dict so a request handler can reset before a chat
+# call and read the totals afterwards, across every provider call the agent
+# makes (rerank / answer / extraction / scoring).  Providers that do not
+# expose usage simply never record anything — ``usage_snapshot()`` then
+# reports ``calls == 0`` and the caller shows "n/a" instead of inventing
+# numbers.  Totals are NEVER faked or estimated here.
+# ---------------------------------------------------------------------------
+
+_USAGE = threading.local()
+
+
+def usage_reset() -> None:
+    """Clear this thread's accumulated token usage counters."""
+    _USAGE.acc = None
+
+
+def usage_snapshot() -> dict:
+    """Return this thread's accumulated usage as a plain dict.
+
+    Keys: ``prompt_tokens``, ``completion_tokens``, ``total_tokens``,
+    ``calls``.  All zeros when no provider call recorded usage yet.
+    """
+    acc = getattr(_USAGE, "acc", None)
+    if not acc:
+        return {"prompt_tokens": 0, "completion_tokens": 0,
+                "total_tokens": 0, "calls": 0}
+    return dict(acc)
+
+
+def _record_usage(completion) -> None:
+    """Best-effort: add *completion.usage* to this thread's counters."""
+    try:
+        usage = getattr(completion, "usage", None)
+        if usage is None:
+            return
+        acc = getattr(_USAGE, "acc", None)
+        if acc is None:
+            acc = _USAGE.acc = {
+                "prompt_tokens": 0, "completion_tokens": 0,
+                "total_tokens": 0, "calls": 0,
+            }
+        acc["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+        acc["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+        acc["total_tokens"] += int(getattr(usage, "total_tokens", 0) or 0)
+        acc["calls"] += 1
+    except Exception:
+        pass  # accounting must never break the provider call
 
 # ---------------------------------------------------------------------------
 # Default model names — override via env if needed
@@ -199,6 +252,7 @@ def _call_groq(prompt: str, system: str | None, **kwargs) -> str:
                 messages=messages,
                 **create_kwargs,
             )
+            _record_usage(completion)
             break
         except Exception as exc:
             delay = _rate_limit_delay(str(exc), attempt)
